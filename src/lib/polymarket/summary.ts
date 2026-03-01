@@ -258,6 +258,7 @@ interface FetchOptions {
   pageSize?: number;
   dedupeKey?: (row: unknown) => string;
   nonFatalStatuses?: number[];
+  queryParams?: Record<string, string | number | boolean>;
 }
 
 const dedupeRows = <T>(rows: T[], dedupeKey?: (row: unknown) => string): T[] => {
@@ -294,11 +295,19 @@ const fetchPaginated = async <T>(endpoint: string, wallet: string, options: Fetc
     url.searchParams.set("user", wallet);
     url.searchParams.set("limit", String(pageSize));
     url.searchParams.set("offset", String(offset));
+    for (const [key, value] of Object.entries(options.queryParams ?? {})) {
+      url.searchParams.set(key, String(value));
+    }
 
     const response = await fetch(url.toString(), { cache: "no-store" });
     if (!response.ok) {
       if (nonFatalStatuses.has(response.status)) {
-        break;
+        // Some Data API endpoints return 400 when offset exceeds the allowed max.
+        // Treat that as "end of pagination" only after at least one successful page.
+        if (page > 0) {
+          break;
+        }
+        throw new Error(`Polymarket API error (${response.status}) at ${endpoint}`);
       }
       throw new Error(`Polymarket API error (${response.status}) at ${endpoint}`);
     }
@@ -821,8 +830,10 @@ const buildPairExecutionFromClosedRows = (
 export const getPolymarketSummary = async (wallet: string): Promise<PolymarketSummary> => {
   const [trades, closedPositions, openPositions, activity] = await Promise.all([
     fetchPaginated<PolymarketTrade>("/trades", wallet, {
-      pageSize: 50,
+      pageSize: 500,
       maxOffset: 100_000,
+      nonFatalStatuses: [400],
+      queryParams: { takerOnly: false },
       dedupeKey: (row) => {
         const trade = row as PolymarketTrade;
         return (
