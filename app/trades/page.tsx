@@ -784,58 +784,63 @@ export default function TradesPage() {
           Uses your public wallet address to pull your Polymarket trading stats directly from API data.
         </p>
 
-        <div className="mt-5 rounded-2xl border border-slate-200/90 bg-white/70 p-4">
-          <div className="flex flex-col gap-3 lg:flex-row lg:items-end">
-            <div className="lg:w-64">
-              <label className="text-xs font-medium uppercase tracking-wide text-slate-500">Property</label>
-              <select
-                value={selectedPropertyId}
-                onChange={(event) => {
-                  const propertyId = event.target.value;
-                  setSelectedPropertyId(propertyId);
-                  const nextWallet = properties.find((property) => property.id === propertyId)?.wallets[0] ?? null;
-                  setSelectedWalletId(nextWallet?.id ?? "");
-                }}
-                className="mt-1.5 h-11 w-full rounded-lg border border-slate-300 bg-white px-3 text-sm text-slate-800"
-              >
-                <option value="">No property selected</option>
-                {properties.map((property) => (
-                  <option key={property.id} value={property.id}>
-                    {property.name}
-                  </option>
-                ))}
-              </select>
-            </div>
-            <div className="lg:w-[30rem]">
-              <label className="text-xs font-medium uppercase tracking-wide text-slate-500">Stored Wallet</label>
-              <select
-                value={selectedWalletId}
-                onChange={(event) => {
-                  const walletId = event.target.value;
-                  setSelectedWalletId(walletId);
-                }}
-                className="mt-1.5 h-11 w-full rounded-lg border border-slate-300 bg-white px-3 text-sm text-slate-800"
-                disabled={!selectedProperty}
-              >
-                <option value="">{selectedProperty ? "Select wallet profile" : "Select a property first"}</option>
-                {selectedProperty?.wallets.map((wallet) => (
-                  <option key={wallet.id} value={wallet.id}>
-                    {wallet.label ? `${wallet.label} · ${wallet.wallet.slice(0, 10)}...` : wallet.wallet}
-                  </option>
-                ))}
-              </select>
-            </div>
-            <button
-              type="button"
-              onClick={onFetchSummary}
-              disabled={isLoading || !selectedPropertyId || !selectedWalletId}
-              className="inline-flex h-11 items-center justify-center rounded-xl border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-800 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
+        <div className="mt-5 flex flex-col gap-3 lg:flex-row lg:items-end">
+          <div className="lg:w-64">
+            <label className="text-xs font-medium uppercase tracking-wide text-slate-500">Property</label>
+            <select
+              value={selectedPropertyId}
+              onChange={(event) => {
+                const propertyId = event.target.value;
+                setSelectedPropertyId(propertyId);
+                const nextWallet = properties.find((property) => property.id === propertyId)?.wallets[0] ?? null;
+                setSelectedWalletId(nextWallet?.id ?? "");
+              }}
+              className="mt-1.5 h-11 w-full rounded-lg border border-slate-300 bg-white px-3 text-sm text-slate-800"
             >
-              {isLoading ? "Syncing..." : "Sync + Fetch"}
-            </button>
+              <option value="">No property selected</option>
+              {properties.map((property) => (
+                <option key={property.id} value={property.id}>
+                  {property.name}
+                </option>
+              ))}
+            </select>
           </div>
-          <p className="mt-2 text-xs text-slate-500">{isPropertiesLoading ? "Loading properties..." : ""}</p>
+          <div className="lg:w-[30rem]">
+            <label className="text-xs font-medium uppercase tracking-wide text-slate-500">Stored Wallet</label>
+            <select
+              value={selectedWalletId}
+              onChange={(event) => {
+                const walletId = event.target.value;
+                setSelectedWalletId(walletId);
+              }}
+              className="mt-1.5 h-11 w-full rounded-lg border border-slate-300 bg-white px-3 text-sm text-slate-800"
+              disabled={!selectedProperty}
+            >
+              <option value="">{selectedProperty ? "Select wallet profile" : "Select a property first"}</option>
+              {selectedProperty?.wallets.map((wallet) => (
+                <option key={wallet.id} value={wallet.id}>
+                  {wallet.label ? `${wallet.label} · ${wallet.wallet.slice(0, 10)}...` : wallet.wallet}
+                </option>
+              ))}
+            </select>
+          </div>
+          <button
+            type="button"
+            onClick={onFetchSummary}
+            disabled={isLoading || !selectedPropertyId || !selectedWalletId}
+            className="inline-flex h-11 w-[10.5rem] items-center justify-center rounded-xl border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-800 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            {isLoading ? (
+              <span className="inline-flex items-center gap-2">
+                <span className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-slate-300 border-t-slate-700" />
+                Syncing
+              </span>
+            ) : (
+              "Sync + Fetch"
+            )}
+          </button>
         </div>
+        <p className="mt-2 text-xs text-slate-500">{isPropertiesLoading ? "Loading properties..." : ""}</p>
 
         {error && <p className="mt-4 text-sm font-medium text-red-700">{error}</p>}
       </section>
