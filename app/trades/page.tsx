@@ -50,6 +50,7 @@ interface PolymarketSummaryResponse {
     closedAt: string;
     eventTime: string | null;
     marketTitle: string;
+    marketUrl: string | null;
     pairStatus: "Paired" | "Missing Leg";
     result: "Won" | "Lost" | "Flat";
     upUnits: number;
@@ -74,6 +75,25 @@ interface PolymarketSummaryResponse {
   };
 }
 
+interface PersistedWalletProfile {
+  id: string;
+  propertyId: string;
+  wallet: string;
+  label: string | null;
+  strategyTag: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+interface PersistedProperty {
+  id: string;
+  name: string;
+  description: string | null;
+  createdAt: string;
+  updatedAt: string;
+  wallets: PersistedWalletProfile[];
+}
+
 const formatUsd = (value: number): string =>
   new Intl.NumberFormat("en-US", {
     style: "currency",
@@ -85,13 +105,78 @@ const formatUsd = (value: number): string =>
 const formatSignedUsd = (value: number): string => `${value >= 0 ? "+" : "-"}${formatUsd(Math.abs(value))}`;
 const formatSignedCents = (value: number): string => `${value >= 0 ? "+" : "-"}${Math.abs(value).toFixed(2)}c`;
 const formatAvgPriceCents = (value: number | null): string => (value === null ? "-" : `${Math.round(value * 100)}c`);
-type DateRangePreset = "all" | "24h" | "7d" | "30d" | "month_to_date" | "last_month" | "custom";
+type DateRangePreset = "all" | "12h" | "24h" | "7d" | "30d" | "month_to_date" | "last_month" | "custom";
+type AbDurationPreset = "1h" | "3h" | "6h" | "12h" | "24h" | "custom";
+const MARKET_TIME_ZONE = "America/New_York";
 
-const toDateInput = (date: Date): string => {
+const toDateTimeInput = (date: Date): string => {
   const y = date.getFullYear();
   const m = `${date.getMonth() + 1}`.padStart(2, "0");
   const d = `${date.getDate()}`.padStart(2, "0");
-  return `${y}-${m}-${d}`;
+  const hh = `${date.getHours()}`.padStart(2, "0");
+  const mm = `${date.getMinutes()}`.padStart(2, "0");
+  return `${y}-${m}-${d}T${hh}:${mm}`;
+};
+
+const parseDateTimeInputMs = (value: string): number | null => {
+  if (!value) {
+    return null;
+  }
+  const parsed = new Date(value).getTime();
+  return Number.isFinite(parsed) ? parsed : null;
+};
+
+const floorToHourMs = (valueMs: number): number => Math.floor(valueMs / (60 * 60 * 1000)) * (60 * 60 * 1000);
+
+const getDateTimeWindowBounds = (
+  startAt: string,
+  endAt: string
+): { startMs: number | null; endMs: number | null } => {
+  const startMs = parseDateTimeInputMs(startAt);
+  const endMs = parseDateTimeInputMs(endAt);
+  return {
+    startMs: startMs !== null ? startMs : null,
+    endMs: endMs !== null ? endMs : null
+  };
+};
+
+const getComparisonDurationMs = (preset: AbDurationPreset, customHours: string): number => {
+  if (preset === "custom") {
+    const hours = Number(customHours);
+    if (!Number.isFinite(hours) || hours <= 0) {
+      return 0;
+    }
+    return hours * 60 * 60 * 1000;
+  }
+  const presetHours: Record<Exclude<AbDurationPreset, "custom">, number> = {
+    "1h": 1,
+    "3h": 3,
+    "6h": 6,
+    "12h": 12,
+    "24h": 24
+  };
+  return presetHours[preset] * 60 * 60 * 1000;
+};
+
+const formatWindowLabel = (startMs: number | null, endMs: number | null): string => {
+  if (startMs === null || endMs === null) {
+    return "-";
+  }
+  const startText = new Date(startMs).toLocaleString(undefined, {
+    timeZone: MARKET_TIME_ZONE,
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit"
+  });
+  const endText = new Date(endMs).toLocaleString(undefined, {
+    timeZone: MARKET_TIME_ZONE,
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit"
+  });
+  return `${startText} to ${endText}`;
 };
 
 const getDateRangeBounds = (
@@ -104,6 +189,9 @@ const getDateRangeBounds = (
 
   if (preset === "24h") {
     return { startMs: nowMs - 24 * 60 * 60 * 1000, endMs: nowMs };
+  }
+  if (preset === "12h") {
+    return { startMs: nowMs - 12 * 60 * 60 * 1000, endMs: nowMs };
   }
   if (preset === "7d") {
     return { startMs: nowMs - 7 * 24 * 60 * 60 * 1000, endMs: nowMs };
@@ -147,18 +235,6 @@ const isInDateRange = (timestampMs: number, startMs: number | null, endMs: numbe
 const getRowTimeMs = (row: PolymarketSummaryResponse["closedPairRows"][number]): number =>
   Date.parse(row.eventTime ?? row.closedAt);
 
-const getWindowBounds = (startDate: string, endDate: string): { startMs: number | null; endMs: number | null } => {
-  if (!startDate || !endDate) {
-    return { startMs: null, endMs: null };
-  }
-  const startMs = new Date(`${startDate}T00:00:00`).getTime();
-  const endMs = new Date(`${endDate}T00:00:00`).getTime() + 24 * 60 * 60 * 1000;
-  return {
-    startMs: Number.isFinite(startMs) ? startMs : null,
-    endMs: Number.isFinite(endMs) ? endMs : null
-  };
-};
-
 const matchesStrategy = (marketTitle: string, strategy: string, customFilter: string): boolean => {
   const title = marketTitle.toLowerCase();
   if (strategy === "btc_updown") {
@@ -198,6 +274,9 @@ const getDatePresetLabel = (
 ): string => {
   if (preset === "24h") {
     return "Past 24 hours";
+  }
+  if (preset === "12h") {
+    return "Past 12 hours";
   }
   if (preset === "7d") {
     return "Past 7 days";
@@ -276,12 +355,15 @@ const computeEdgeDistribution = (rows: PolymarketSummaryResponse["closedPairRows
     .filter((row) => row.pairStatus === "Paired" && row.edge !== null)
     .map((row) => (row.edge ?? 0) * 100)
     .sort((a, b) => a - b);
+  const negativeCount = edgesCents.filter((value) => value < 0).length;
 
   return {
     sample: edgesCents.length,
+    min: edgesCents[0] ?? 0,
     p10: percentile(edgesCents, 10),
     p50: percentile(edgesCents, 50),
-    p90: percentile(edgesCents, 90)
+    p90: percentile(edgesCents, 90),
+    negativeRatePct: edgesCents.length > 0 ? (negativeCount / edgesCents.length) * 100 : 0
   };
 };
 
@@ -375,8 +457,11 @@ const metricColor = (value: number): string => {
 };
 
 export default function TradesPage() {
-  const [walletInput, setWalletInput] = useState("");
   const [summary, setSummary] = useState<PolymarketSummaryResponse | null>(null);
+  const [properties, setProperties] = useState<PersistedProperty[]>([]);
+  const [selectedPropertyId, setSelectedPropertyId] = useState("");
+  const [selectedWalletId, setSelectedWalletId] = useState("");
+  const [isPropertiesLoading, setIsPropertiesLoading] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [closedRowsVisible, setClosedRowsVisible] = useState(50);
@@ -385,12 +470,30 @@ export default function TradesPage() {
   const [dateRangePreset, setDateRangePreset] = useState<DateRangePreset>("all");
   const [customStartDate, setCustomStartDate] = useState("");
   const [customEndDate, setCustomEndDate] = useState("");
-  const [windowAStart, setWindowAStart] = useState("");
-  const [windowAEnd, setWindowAEnd] = useState("");
-  const [windowBStart, setWindowBStart] = useState("");
-  const [windowBEnd, setWindowBEnd] = useState("");
+  const [tablePairFilter, setTablePairFilter] = useState<"all" | "missing" | "paired">("all");
+  const [comparisonMode, setComparisonMode] = useState<"quick" | "manual">("quick");
+  const [comparisonDurationPreset, setComparisonDurationPreset] = useState<AbDurationPreset>("24h");
+  const [comparisonCustomHours, setComparisonCustomHours] = useState("6");
+  const [quickAnchorEndMs, setQuickAnchorEndMs] = useState<number | null>(null);
+  const [windowAStartAt, setWindowAStartAt] = useState("");
+  const [windowAEndAt, setWindowAEndAt] = useState("");
+  const [windowBStartAt, setWindowBStartAt] = useState("");
+  const [windowBEndAt, setWindowBEndAt] = useState("");
+  const [manualAppliedWindowAStartAt, setManualAppliedWindowAStartAt] = useState("");
+  const [manualAppliedWindowAEndAt, setManualAppliedWindowAEndAt] = useState("");
+  const [manualAppliedWindowBStartAt, setManualAppliedWindowBStartAt] = useState("");
+  const [manualAppliedWindowBEndAt, setManualAppliedWindowBEndAt] = useState("");
   const [isAllTimeSummaryOpen, setIsAllTimeSummaryOpen] = useState(true);
   const [isIterationComparisonOpen, setIsIterationComparisonOpen] = useState(false);
+
+  const selectedProperty = useMemo(
+    () => properties.find((property) => property.id === selectedPropertyId) ?? null,
+    [properties, selectedPropertyId]
+  );
+  const selectedWalletProfile = useMemo(
+    () => selectedProperty?.wallets.find((wallet) => wallet.id === selectedWalletId) ?? null,
+    [selectedProperty, selectedWalletId]
+  );
 
   const strategyClosedRows = useMemo(() => {
     if (!summary) {
@@ -405,6 +508,16 @@ export default function TradesPage() {
       .filter((row) => isInDateRange(getRowTimeMs(row), startMs, endMs))
       .sort((a, b) => getRowTimeMs(b) - getRowTimeMs(a));
   }, [strategyClosedRows, dateRangePreset, customStartDate, customEndDate]);
+
+  const tableClosedRows = useMemo(() => {
+    if (tablePairFilter === "missing") {
+      return filteredClosedRows.filter((row) => row.pairStatus === "Missing Leg");
+    }
+    if (tablePairFilter === "paired") {
+      return filteredClosedRows.filter((row) => row.pairStatus === "Paired");
+    }
+    return filteredClosedRows;
+  }, [filteredClosedRows, tablePairFilter]);
 
   const closedAuditSummary = useMemo(() => {
     const missingLegs = filteredClosedRows.filter((row) => row.pairStatus === "Missing Leg").length;
@@ -429,21 +542,58 @@ export default function TradesPage() {
     [filteredClosedRows]
   );
 
+  const comparisonDurationMs = useMemo(
+    () => getComparisonDurationMs(comparisonDurationPreset, comparisonCustomHours),
+    [comparisonDurationPreset, comparisonCustomHours]
+  );
+
+  const quickComparisonBounds = useMemo(() => {
+    if (quickAnchorEndMs === null || comparisonDurationMs <= 0) {
+      return { aStartMs: null, aEndMs: null, bStartMs: null, bEndMs: null };
+    }
+    return {
+      aStartMs: quickAnchorEndMs - 2 * comparisonDurationMs,
+      aEndMs: quickAnchorEndMs - comparisonDurationMs,
+      bStartMs: quickAnchorEndMs - comparisonDurationMs,
+      bEndMs: quickAnchorEndMs
+    };
+  }, [quickAnchorEndMs, comparisonDurationMs]);
+
+  const manualWindowABounds = useMemo(
+    () => getDateTimeWindowBounds(manualAppliedWindowAStartAt, manualAppliedWindowAEndAt),
+    [manualAppliedWindowAStartAt, manualAppliedWindowAEndAt]
+  );
+  const manualWindowBBounds = useMemo(
+    () => getDateTimeWindowBounds(manualAppliedWindowBStartAt, manualAppliedWindowBEndAt),
+    [manualAppliedWindowBStartAt, manualAppliedWindowBEndAt]
+  );
+
+  const activeWindowABounds =
+    comparisonMode === "manual"
+      ? manualWindowABounds
+      : { startMs: quickComparisonBounds.aStartMs, endMs: quickComparisonBounds.aEndMs };
+  const activeWindowBBounds =
+    comparisonMode === "manual"
+      ? manualWindowBBounds
+      : { startMs: quickComparisonBounds.bStartMs, endMs: quickComparisonBounds.bEndMs };
+
   const windowARows = useMemo(() => {
-    const { startMs, endMs } = getWindowBounds(windowAStart, windowAEnd);
-    if (startMs === null || endMs === null) {
+    if (activeWindowABounds.startMs === null || activeWindowABounds.endMs === null) {
       return [];
     }
-    return strategyClosedRows.filter((row) => isInDateRange(getRowTimeMs(row), startMs, endMs));
-  }, [strategyClosedRows, windowAStart, windowAEnd]);
+    return strategyClosedRows.filter((row) =>
+      isInDateRange(getRowTimeMs(row), activeWindowABounds.startMs, activeWindowABounds.endMs)
+    );
+  }, [strategyClosedRows, activeWindowABounds.startMs, activeWindowABounds.endMs]);
 
   const windowBRows = useMemo(() => {
-    const { startMs, endMs } = getWindowBounds(windowBStart, windowBEnd);
-    if (startMs === null || endMs === null) {
+    if (activeWindowBBounds.startMs === null || activeWindowBBounds.endMs === null) {
       return [];
     }
-    return strategyClosedRows.filter((row) => isInDateRange(getRowTimeMs(row), startMs, endMs));
-  }, [strategyClosedRows, windowBStart, windowBEnd]);
+    return strategyClosedRows.filter((row) =>
+      isInDateRange(getRowTimeMs(row), activeWindowBBounds.startMs, activeWindowBBounds.endMs)
+    );
+  }, [strategyClosedRows, activeWindowBBounds.startMs, activeWindowBBounds.endMs]);
 
   const windowAMetrics = useMemo(() => computeWindowMetrics(windowARows), [windowARows]);
   const windowBMetrics = useMemo(() => computeWindowMetrics(windowBRows), [windowBRows]);
@@ -459,6 +609,31 @@ export default function TradesPage() {
     }),
     [windowAMetrics, windowBMetrics]
   );
+  const activeWindowALabel = useMemo(
+    () => formatWindowLabel(activeWindowABounds.startMs, activeWindowABounds.endMs),
+    [activeWindowABounds.startMs, activeWindowABounds.endMs]
+  );
+  const activeWindowBLabel = useMemo(
+    () => formatWindowLabel(activeWindowBBounds.startMs, activeWindowBBounds.endMs),
+    [activeWindowBBounds.startMs, activeWindowBBounds.endMs]
+  );
+  const hasManualWindowChanges = useMemo(
+    () =>
+      windowAStartAt !== manualAppliedWindowAStartAt ||
+      windowAEndAt !== manualAppliedWindowAEndAt ||
+      windowBStartAt !== manualAppliedWindowBStartAt ||
+      windowBEndAt !== manualAppliedWindowBEndAt,
+    [
+      windowAStartAt,
+      manualAppliedWindowAStartAt,
+      windowAEndAt,
+      manualAppliedWindowAEndAt,
+      windowBStartAt,
+      manualAppliedWindowBStartAt,
+      windowBEndAt,
+      manualAppliedWindowBEndAt
+    ]
+  );
 
   const strategyFilterLabel = useMemo(
     () => getStrategyLabel(strategyFilter, customStrategyFilter),
@@ -469,34 +644,103 @@ export default function TradesPage() {
     [dateRangePreset, customStartDate, customEndDate]
   );
 
+  const loadProperties = async (
+    preferredPropertyId?: string,
+    preferredWalletId?: string
+  ): Promise<PersistedProperty[] | null> => {
+    setIsPropertiesLoading(true);
+    try {
+      const response = await fetch("/api/properties");
+      const payload = (await response.json()) as {
+        properties?: PersistedProperty[];
+        error?: string;
+      };
+      if (!response.ok) {
+        throw new Error(payload.error ?? "Failed to load properties.");
+      }
+
+      const nextProperties = payload.properties ?? [];
+      setProperties(nextProperties);
+
+      const resolvedPropertyId =
+        preferredPropertyId && nextProperties.some((property) => property.id === preferredPropertyId)
+          ? preferredPropertyId
+          : selectedPropertyId && nextProperties.some((property) => property.id === selectedPropertyId)
+            ? selectedPropertyId
+            : nextProperties[0]?.id ?? "";
+      setSelectedPropertyId(resolvedPropertyId);
+
+      const walletsForProperty = nextProperties.find((property) => property.id === resolvedPropertyId)?.wallets ?? [];
+      const resolvedWalletId =
+        preferredWalletId && walletsForProperty.some((wallet) => wallet.id === preferredWalletId)
+          ? preferredWalletId
+          : selectedWalletId && walletsForProperty.some((wallet) => wallet.id === selectedWalletId)
+            ? selectedWalletId
+            : walletsForProperty[0]?.id ?? "";
+      setSelectedWalletId(resolvedWalletId);
+
+      const selectedWallet = walletsForProperty.find((wallet) => wallet.id === resolvedWalletId);
+      if (selectedWallet) {
+        // no-op: wallet is sourced from stored wallet profile on sync
+      }
+      return nextProperties;
+    } catch (loadError) {
+      const message = loadError instanceof Error ? loadError.message : "Failed to load properties.";
+      setError(message);
+      return null;
+    } finally {
+      setIsPropertiesLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    void loadProperties();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   useEffect(() => {
     setClosedRowsVisible(50);
-  }, [summary?.asOf, strategyFilter, customStrategyFilter, dateRangePreset, customStartDate, customEndDate]);
+  }, [summary?.asOf, strategyFilter, customStrategyFilter, dateRangePreset, customStartDate, customEndDate, tablePairFilter]);
 
   useEffect(() => {
     if (!summary) {
       return;
     }
-    const now = new Date();
-    const bEnd = new Date(now);
-    const bStart = new Date(now);
-    bStart.setDate(bStart.getDate() - 6);
+    const roundedNowMs = floorToHourMs(Date.now());
+    const durationMs = 24 * 60 * 60 * 1000;
+    const bStartMs = roundedNowMs - durationMs;
+    const aStartMs = bStartMs - durationMs;
 
-    const aEnd = new Date(bStart);
-    aEnd.setDate(aEnd.getDate() - 1);
-    const aStart = new Date(aEnd);
-    aStart.setDate(aStart.getDate() - 6);
-
-    setWindowAStart(toDateInput(aStart));
-    setWindowAEnd(toDateInput(aEnd));
-    setWindowBStart(toDateInput(bStart));
-    setWindowBEnd(toDateInput(bEnd));
+    setComparisonMode("quick");
+    setComparisonDurationPreset("24h");
+    setComparisonCustomHours("6");
+    setQuickAnchorEndMs(roundedNowMs);
+    setWindowAStartAt(toDateTimeInput(new Date(aStartMs)));
+    setWindowAEndAt(toDateTimeInput(new Date(bStartMs)));
+    setWindowBStartAt(toDateTimeInput(new Date(bStartMs)));
+    setWindowBEndAt(toDateTimeInput(new Date(roundedNowMs)));
+    setManualAppliedWindowAStartAt(toDateTimeInput(new Date(aStartMs)));
+    setManualAppliedWindowAEndAt(toDateTimeInput(new Date(bStartMs)));
+    setManualAppliedWindowBStartAt(toDateTimeInput(new Date(bStartMs)));
+    setManualAppliedWindowBEndAt(toDateTimeInput(new Date(roundedNowMs)));
   }, [summary, summary?.asOf, strategyFilter, customStrategyFilter]);
 
+  useEffect(() => {
+    if (comparisonMode !== "quick") {
+      return;
+    }
+    setQuickAnchorEndMs(floorToHourMs(Date.now()));
+  }, [comparisonMode, comparisonDurationPreset, comparisonCustomHours]);
+
   const onFetchSummary = async () => {
-    const wallet = walletInput.trim();
+    if (!selectedPropertyId) {
+      setError("Select a property first.");
+      setSummary(null);
+      return;
+    }
+    const wallet = selectedWalletProfile?.wallet ?? "";
     if (!wallet) {
-      setError("Enter your wallet address first.");
+      setError("Select a stored wallet first.");
       setSummary(null);
       return;
     }
@@ -505,23 +749,24 @@ export default function TradesPage() {
     setError(null);
 
     try {
-      const response = await fetch(`/api/polymarket/summary?wallet=${encodeURIComponent(wallet)}`);
-      const payload = (await response.json()) as unknown;
-
-      if (!response.ok) {
-        setSummary(null);
-        const errorMessage =
-          payload && typeof payload === "object" && "error" in payload && typeof payload.error === "string"
-            ? payload.error
-            : "Failed to fetch Polymarket data.";
-        setError(errorMessage);
-        return;
+      const response = await fetch(`/api/properties/${encodeURIComponent(selectedPropertyId)}/sync`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ wallet, forceRefresh: true })
+      });
+      const payload = (await response.json()) as {
+        summary?: PolymarketSummaryResponse;
+        error?: string;
+      };
+      if (!response.ok || !payload.summary) {
+        throw new Error(payload.error ?? "Failed to sync wallet.");
       }
-
-      setSummary(payload as PolymarketSummaryResponse);
-    } catch {
+      setSummary(payload.summary);
+      await loadProperties(selectedPropertyId, selectedWalletId);
+    } catch (fetchError) {
       setSummary(null);
-      setError("Network error while loading your summary.");
+      const message = fetchError instanceof Error ? fetchError.message : "Network error while loading your summary.";
+      setError(message);
     } finally {
       setIsLoading(false);
     }
@@ -539,23 +784,63 @@ export default function TradesPage() {
           Uses your public wallet address to pull your Polymarket trading stats directly from API data.
         </p>
 
-        <div className="mt-5 flex flex-col gap-3 sm:flex-row">
-          <input
-            type="text"
-            placeholder="0x..."
-            value={walletInput}
-            onChange={(event) => setWalletInput(event.target.value)}
-            className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-800"
-          />
+        <div className="mt-5 flex flex-col gap-3 lg:flex-row lg:items-end">
+          <div className="lg:w-64">
+            <label className="text-xs font-medium uppercase tracking-wide text-slate-500">Property</label>
+            <select
+              value={selectedPropertyId}
+              onChange={(event) => {
+                const propertyId = event.target.value;
+                setSelectedPropertyId(propertyId);
+                const nextWallet = properties.find((property) => property.id === propertyId)?.wallets[0] ?? null;
+                setSelectedWalletId(nextWallet?.id ?? "");
+              }}
+              className="mt-1.5 h-11 w-full rounded-lg border border-slate-300 bg-white px-3 text-sm text-slate-800"
+            >
+              <option value="">No property selected</option>
+              {properties.map((property) => (
+                <option key={property.id} value={property.id}>
+                  {property.name}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div className="lg:w-[30rem]">
+            <label className="text-xs font-medium uppercase tracking-wide text-slate-500">Stored Wallet</label>
+            <select
+              value={selectedWalletId}
+              onChange={(event) => {
+                const walletId = event.target.value;
+                setSelectedWalletId(walletId);
+              }}
+              className="mt-1.5 h-11 w-full rounded-lg border border-slate-300 bg-white px-3 text-sm text-slate-800"
+              disabled={!selectedProperty}
+            >
+              <option value="">{selectedProperty ? "Select wallet profile" : "Select a property first"}</option>
+              {selectedProperty?.wallets.map((wallet) => (
+                <option key={wallet.id} value={wallet.id}>
+                  {wallet.label ? `${wallet.label} · ${wallet.wallet.slice(0, 10)}...` : wallet.wallet}
+                </option>
+              ))}
+            </select>
+          </div>
           <button
             type="button"
             onClick={onFetchSummary}
-            disabled={isLoading}
-            className="inline-flex items-center justify-center rounded-xl border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-800 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
+            disabled={isLoading || !selectedPropertyId || !selectedWalletId}
+            className="inline-flex h-11 w-[10.5rem] items-center justify-center rounded-xl border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-800 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
           >
-            {isLoading ? "Loading..." : "Fetch"}
+            {isLoading ? (
+              <span className="inline-flex items-center gap-2">
+                <span className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-slate-300 border-t-slate-700" />
+                Syncing
+              </span>
+            ) : (
+              "Sync + Fetch"
+            )}
           </button>
         </div>
+        <p className="mt-2 text-xs text-slate-500">{isPropertiesLoading ? "Loading properties..." : ""}</p>
 
         {error && <p className="mt-4 text-sm font-medium text-red-700">{error}</p>}
       </section>
@@ -630,7 +915,7 @@ export default function TradesPage() {
                     onChange={(event) =>
                       setStrategyFilter(event.target.value as "all" | "btc_updown" | "eth_updown" | "custom")
                     }
-                    className="w-full rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-800 sm:w-[18rem]"
+                    className="h-11 w-full rounded-lg border border-slate-300 bg-white px-3 text-sm text-slate-800 sm:w-[18rem]"
                   >
                     <option value="all">All closed markets</option>
                     <option value="btc_updown">Bitcoin Up or Down only</option>
@@ -643,7 +928,7 @@ export default function TradesPage() {
                       value={customStrategyFilter}
                       onChange={(event) => setCustomStrategyFilter(event.target.value)}
                       placeholder="e.g. Bitcoin Up or Down"
-                      className="w-full rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-800 sm:w-[18rem]"
+                      className="h-11 w-full rounded-lg border border-slate-300 bg-white px-3 text-sm text-slate-800 sm:w-[18rem]"
                     />
                   )}
                 </div>
@@ -655,9 +940,10 @@ export default function TradesPage() {
                   <select
                     value={dateRangePreset}
                     onChange={(event) => setDateRangePreset(event.target.value as DateRangePreset)}
-                    className="w-full rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-800 sm:w-[13rem]"
+                    className="h-11 w-full rounded-lg border border-slate-300 bg-white px-3 text-sm text-slate-800 sm:w-[13rem]"
                   >
                     <option value="all">All time</option>
+                    <option value="12h">Past 12 hours</option>
                     <option value="24h">Past 24 hours</option>
                     <option value="7d">Past 7 days</option>
                     <option value="30d">Past 30 days</option>
@@ -671,14 +957,14 @@ export default function TradesPage() {
                         type="date"
                         value={customStartDate}
                         onChange={(event) => setCustomStartDate(event.target.value)}
-                        className="w-full rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-800"
+                        className="h-11 w-full rounded-lg border border-slate-300 bg-white px-3 text-sm text-slate-800"
                       />
                       <span className="text-xs text-slate-500">to</span>
                       <input
                         type="date"
                         value={customEndDate}
                         onChange={(event) => setCustomEndDate(event.target.value)}
-                        className="w-full rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-800"
+                        className="h-11 w-full rounded-lg border border-slate-300 bg-white px-3 text-sm text-slate-800"
                       />
                     </>
                   )}
@@ -710,7 +996,15 @@ export default function TradesPage() {
               </span>
             </div>
 
-            <p className="mt-4 rounded-xl border border-emerald-200 bg-emerald-50/70 px-3 py-2 text-xs text-emerald-700">
+            <p
+              className={`mt-4 rounded-xl px-3 py-2 text-xs ${
+                filteredPnlBridge.netPnl > 0
+                  ? "border border-emerald-200 bg-emerald-50/70 text-emerald-700"
+                  : filteredPnlBridge.netPnl < 0
+                    ? "border border-red-200 bg-red-50/70 text-red-700"
+                    : "border border-slate-200 bg-slate-50/80 text-slate-700"
+              }`}
+            >
               Net P/L {formatSignedUsd(filteredPnlBridge.netPnl)} = wins {formatSignedUsd(filteredPnlBridge.grossWins)} +
               losses {formatSignedUsd(filteredPnlBridge.grossLosses)} · missing-leg P/L{" "}
               {formatSignedUsd(filteredPnlBridge.missingLegPnl)}
@@ -779,6 +1073,10 @@ export default function TradesPage() {
                 </div>
                 <p className="mt-2 text-xs text-slate-500">Based on {filteredEdgeDistribution.sample} paired markets</p>
                 <p className="mt-1 text-xs text-slate-500">
+                  Min edge: {formatSignedCents(filteredEdgeDistribution.min)} | Negative-edge rate:{" "}
+                  {filteredEdgeDistribution.negativeRatePct.toFixed(1)}%
+                </p>
+                <p className="mt-1 text-xs text-slate-500">
                   Size-weighted edge: {formatSignedUsd(filteredPnlBridge.sizeWeightedEdgeUsd)} (
                   {formatSignedCents(filteredPnlBridge.sizeWeightedEdgeCentsPerMatchedUnit)} per matched unit)
                 </p>
@@ -837,7 +1135,7 @@ export default function TradesPage() {
                 <h3 className="text-sm font-semibold uppercase tracking-wide text-slate-600">
                   Iteration Comparison (A vs B)
                 </h3>
-                <p className="mt-1 text-xs text-slate-500">Uses strategy filter, independent date windows</p>
+                <p className="mt-1 text-xs text-slate-500">Quick chunk mode with optional advanced manual windows</p>
               </div>
               <span className="text-xs font-medium text-slate-600">
                 {isIterationComparisonOpen ? "Collapse" : "Expand"}
@@ -846,44 +1144,162 @@ export default function TradesPage() {
 
             {isIterationComparisonOpen && (
               <div className="border-t border-slate-200/80 px-5 py-4">
-                <div className="grid gap-3 lg:grid-cols-2">
-                  <div className="rounded-xl border border-slate-200/90 bg-white/70 p-4">
-                    <p className="text-xs font-medium uppercase tracking-wide text-slate-500">Window A (Baseline)</p>
-                    <div className="mt-2 flex flex-wrap items-center gap-2">
-                      <input
-                        type="date"
-                        value={windowAStart}
-                        onChange={(event) => setWindowAStart(event.target.value)}
-                        className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-800"
-                      />
-                      <span className="text-xs text-slate-500">to</span>
-                      <input
-                        type="date"
-                        value={windowAEnd}
-                        onChange={(event) => setWindowAEnd(event.target.value)}
-                        className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-800"
-                      />
+                <div className="rounded-xl border border-slate-200/90 bg-white/70 p-4">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div>
+                      <p className="text-xs font-medium uppercase tracking-wide text-slate-500">Compare Mode</p>
+                      <div className="mt-2 inline-flex rounded-lg border border-slate-200 bg-white p-1">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setComparisonMode("quick");
+                            setQuickAnchorEndMs(floorToHourMs(Date.now()));
+                          }}
+                          className={`rounded-md px-3 py-1.5 text-xs font-medium transition ${
+                            comparisonMode === "quick"
+                              ? "bg-emerald-100 text-emerald-800"
+                              : "text-slate-600 hover:bg-slate-100"
+                          }`}
+                        >
+                          Quick
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setComparisonMode("manual")}
+                          className={`rounded-md px-3 py-1.5 text-xs font-medium transition ${
+                            comparisonMode === "manual"
+                              ? "bg-emerald-100 text-emerald-800"
+                              : "text-slate-600 hover:bg-slate-100"
+                          }`}
+                        >
+                          Advanced
+                        </button>
+                      </div>
                     </div>
+                    <span className="text-xs text-slate-500">Time zone: ET ({MARKET_TIME_ZONE})</span>
                   </div>
+                  {comparisonMode === "quick" ? (
+                    <div
+                      className={`mt-3 grid gap-2 sm:gap-3 lg:items-start ${
+                        comparisonDurationPreset === "custom"
+                          ? "lg:grid-cols-[11rem_9rem_max-content]"
+                          : "lg:grid-cols-[11rem_max-content]"
+                      }`}
+                    >
+                      <div className="flex flex-col">
+                        <label className="text-[11px] uppercase tracking-wide text-slate-500">Chunk size</label>
+                        <select
+                          value={comparisonDurationPreset}
+                          onChange={(event) => setComparisonDurationPreset(event.target.value as AbDurationPreset)}
+                          className="mt-1 h-11 w-full rounded-lg border border-slate-300 bg-white px-3 text-sm text-slate-800"
+                        >
+                          <option value="1h">1 hour</option>
+                          <option value="3h">3 hours</option>
+                          <option value="6h">6 hours</option>
+                          <option value="12h">12 hours</option>
+                          <option value="24h">24 hours</option>
+                          <option value="custom">Custom</option>
+                        </select>
+                      </div>
 
-                  <div className="rounded-xl border border-slate-200/90 bg-white/70 p-4">
-                    <p className="text-xs font-medium uppercase tracking-wide text-slate-500">Window B (Candidate)</p>
-                    <div className="mt-2 flex flex-wrap items-center gap-2">
-                      <input
-                        type="date"
-                        value={windowBStart}
-                        onChange={(event) => setWindowBStart(event.target.value)}
-                        className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-800"
-                      />
-                      <span className="text-xs text-slate-500">to</span>
-                      <input
-                        type="date"
-                        value={windowBEnd}
-                        onChange={(event) => setWindowBEnd(event.target.value)}
-                        className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-800"
-                      />
+                      {comparisonDurationPreset === "custom" && (
+                        <div className="flex flex-col">
+                          <label className="text-[11px] uppercase tracking-wide text-slate-500">Custom hours</label>
+                          <input
+                            type="number"
+                            min="0.25"
+                            step="0.25"
+                            value={comparisonCustomHours}
+                            onChange={(event) => setComparisonCustomHours(event.target.value)}
+                            className="mt-1 h-11 w-full rounded-lg border border-slate-300 bg-white px-3 text-sm text-slate-800"
+                          />
+                        </div>
+                      )}
+
+                      <div className="flex flex-col">
+                        <span className="text-[11px] uppercase tracking-wide text-transparent select-none">Action</span>
+                        <button
+                          type="button"
+                          onClick={() => setQuickAnchorEndMs(floorToHourMs(Date.now()))}
+                          className="mt-1 h-11 w-fit whitespace-nowrap rounded-lg border border-slate-300 bg-white px-4 text-xs font-medium text-slate-700 transition hover:bg-slate-50"
+                        >
+                          Refresh to now
+                        </button>
+                      </div>
                     </div>
-                  </div>
+                  ) : (
+                    <div className="mt-3">
+                      <div className="grid gap-3 lg:grid-cols-2">
+                        <div className="rounded-xl border border-slate-200/90 bg-white/80 p-4">
+                          <p className="text-xs font-medium uppercase tracking-wide text-slate-500">Window A (Baseline)</p>
+                          <div className="mt-2 flex flex-wrap items-center gap-2">
+                            <input
+                              type="datetime-local"
+                              value={windowAStartAt}
+                              onChange={(event) => setWindowAStartAt(event.target.value)}
+                              className="h-11 rounded-lg border border-slate-300 bg-white px-3 text-sm text-slate-800"
+                            />
+                            <span className="text-xs text-slate-500">to</span>
+                            <input
+                              type="datetime-local"
+                              value={windowAEndAt}
+                              onChange={(event) => setWindowAEndAt(event.target.value)}
+                              className="h-11 rounded-lg border border-slate-300 bg-white px-3 text-sm text-slate-800"
+                            />
+                          </div>
+                        </div>
+
+                        <div className="rounded-xl border border-slate-200/90 bg-white/80 p-4">
+                          <p className="text-xs font-medium uppercase tracking-wide text-slate-500">Window B (Candidate)</p>
+                          <div className="mt-2 flex flex-wrap items-center gap-2">
+                            <input
+                              type="datetime-local"
+                              value={windowBStartAt}
+                              onChange={(event) => setWindowBStartAt(event.target.value)}
+                              className="h-11 rounded-lg border border-slate-300 bg-white px-3 text-sm text-slate-800"
+                            />
+                            <span className="text-xs text-slate-500">to</span>
+                            <input
+                              type="datetime-local"
+                              value={windowBEndAt}
+                              onChange={(event) => setWindowBEndAt(event.target.value)}
+                              className="h-11 rounded-lg border border-slate-300 bg-white px-3 text-sm text-slate-800"
+                            />
+                          </div>
+                        </div>
+                      </div>
+                      <div className="mt-3 flex justify-end">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setManualAppliedWindowAStartAt(windowAStartAt);
+                            setManualAppliedWindowAEndAt(windowAEndAt);
+                            setManualAppliedWindowBStartAt(windowBStartAt);
+                            setManualAppliedWindowBEndAt(windowBEndAt);
+                            setComparisonMode("manual");
+                          }}
+                          disabled={!hasManualWindowChanges}
+                          className={`h-11 rounded-lg border px-4 text-xs font-medium transition ${
+                            hasManualWindowChanges
+                              ? "border-emerald-300 bg-emerald-100 text-emerald-800 hover:bg-emerald-50"
+                              : "cursor-not-allowed border-slate-300 bg-white text-slate-500"
+                          }`}
+                        >
+                          Apply windows
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
+                  {comparisonMode === "quick" && (
+                    <p className="mt-2 text-xs text-slate-500">
+                      Quick logic: B = last chunk ending now. A = immediately previous chunk.
+                    </p>
+                  )}
+                  <p className="mt-3 text-xs text-slate-600">
+                    Active mode: <span className="font-medium text-slate-700">{comparisonMode === "quick" ? "Quick" : "Manual"}</span> |
+                    A {activeWindowALabel} | B {activeWindowBLabel}
+                  </p>
                 </div>
 
                 <div className="mt-4 overflow-x-auto rounded-xl border border-slate-200/90 bg-white/80">
@@ -1015,6 +1431,42 @@ export default function TradesPage() {
                 Closed pairs sorted by market event time (most recent first). This table is the source for filtered pair
                 metrics.
               </p>
+              <div className="mt-3 flex flex-wrap items-center gap-2 text-xs">
+                <span className="font-semibold uppercase tracking-wide text-slate-500">Table view</span>
+                <button
+                  type="button"
+                  onClick={() => setTablePairFilter("all")}
+                  className={`rounded-full border px-2.5 py-1 font-medium transition ${
+                    tablePairFilter === "all"
+                      ? "border-slate-300 bg-slate-100 text-slate-800"
+                      : "border-slate-200 bg-white text-slate-700 hover:border-slate-300"
+                  }`}
+                >
+                  All
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setTablePairFilter("missing")}
+                  className={`rounded-full border px-2.5 py-1 font-medium transition ${
+                    tablePairFilter === "missing"
+                      ? "border-amber-300 bg-amber-100 text-amber-900"
+                      : "border-amber-200 bg-amber-50 text-amber-800 hover:border-amber-300"
+                  }`}
+                >
+                  Missing Leg only
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setTablePairFilter("paired")}
+                  className={`rounded-full border px-2.5 py-1 font-medium transition ${
+                    tablePairFilter === "paired"
+                      ? "border-emerald-300 bg-emerald-100 text-emerald-900"
+                      : "border-emerald-200 bg-emerald-50 text-emerald-800 hover:border-emerald-300"
+                  }`}
+                >
+                  Paired only
+                </button>
+              </div>
             </div>
             <div className="sticky top-[5.25rem] z-10 border-y border-slate-200/80 bg-white/90 px-4 py-2 backdrop-blur-sm sm:px-5">
               <div className="flex flex-wrap items-center gap-2 text-xs">
@@ -1036,7 +1488,7 @@ export default function TradesPage() {
                 </span>
               </div>
             </div>
-            <div className="overflow-x-auto px-3 sm:px-4">
+            <div className="overflow-x-auto">
               <table className="w-full border-collapse text-sm">
                 <thead className="bg-slate-100/95">
                   <tr>
@@ -1051,7 +1503,7 @@ export default function TradesPage() {
                   </tr>
                 </thead>
                 <tbody>
-                  {filteredClosedRows.slice(0, closedRowsVisible).map((row) => (
+                  {tableClosedRows.slice(0, closedRowsVisible).map((row) => (
                     <tr key={row.id} className="odd:bg-white even:bg-slate-50/60">
                       <td className="border-b border-slate-100 pl-4 pr-2 py-2 text-slate-700">
                         <p>{new Date(row.eventTime ?? row.closedAt).toLocaleDateString()}</p>
@@ -1076,9 +1528,21 @@ export default function TradesPage() {
                         {row.result}
                       </td>
                       <td className="border-b border-slate-100 px-3 py-2 text-slate-700">
-                        <p className="whitespace-nowrap text-[0.9rem] leading-snug text-slate-800" title={row.marketTitle}>
-                          {row.marketTitle}
-                        </p>
+                        {row.marketUrl ? (
+                          <a
+                            href={row.marketUrl}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="whitespace-nowrap text-[0.9rem] leading-snug text-emerald-700 underline decoration-emerald-400/70 underline-offset-2 hover:text-emerald-800"
+                            title={`Open on Polymarket: ${row.marketTitle}`}
+                          >
+                            {row.marketTitle}
+                          </a>
+                        ) : (
+                          <p className="whitespace-nowrap text-[0.9rem] leading-snug text-slate-800" title={row.marketTitle}>
+                            {row.marketTitle}
+                          </p>
+                        )}
                       </td>
                       <td className="border-b border-slate-100 px-3 py-2 text-slate-700">
                         {row.upUnits > 0 ? (
@@ -1128,7 +1592,7 @@ export default function TradesPage() {
             </div>
             <div className="flex flex-wrap items-center justify-between gap-2 border-t border-slate-200/80 px-6 py-3 text-sm">
               <p className="text-slate-600">
-                Showing {Math.min(closedRowsVisible, filteredClosedRows.length)} of {filteredClosedRows.length} pairs
+                Showing {Math.min(closedRowsVisible, tableClosedRows.length)} of {tableClosedRows.length} pairs
               </p>
               <p className="text-xs text-slate-500">
                 Wallet {summary.wallet.slice(0, 8)}...{summary.wallet.slice(-4)} · As of{" "}
@@ -1144,7 +1608,7 @@ export default function TradesPage() {
                     Show less
                   </button>
                 )}
-                {closedRowsVisible < filteredClosedRows.length && (
+                {closedRowsVisible < tableClosedRows.length && (
                   <button
                     type="button"
                     onClick={() => setClosedRowsVisible((current) => current + 50)}

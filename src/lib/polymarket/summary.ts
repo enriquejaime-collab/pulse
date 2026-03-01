@@ -27,6 +27,7 @@ interface PolymarketPosition {
 }
 
 interface PolymarketActivity {
+  [key: string]: unknown;
   type?: string;
   usdcSize?: number | string;
 }
@@ -78,6 +79,7 @@ export interface PolymarketSummary {
     closedAt: string;
     eventTime: string | null;
     marketTitle: string;
+    marketUrl: string | null;
     pairStatus: "Paired" | "Missing Leg";
     result: "Won" | "Lost" | "Flat";
     upUnits: number;
@@ -130,6 +132,7 @@ interface ClosedLegAggregate {
 interface ClosedPairAggregate {
   marketTitle: string;
   closedAtMs: number;
+  marketUrl: string | null;
   legs: Record<"UP" | "DOWN", ClosedLegAggregate>;
 }
 
@@ -157,6 +160,17 @@ const toNumber = (value: unknown): number => {
     return Number.isFinite(parsed) ? parsed : 0;
   }
   return 0;
+};
+
+const toFiniteNumberOrNull = (value: unknown): number | null => {
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? value : null;
+  }
+  if (typeof value === "string") {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
 };
 
 const toTimestampMs = (value: unknown): number => {
@@ -256,6 +270,7 @@ interface FetchOptions {
   pageSize?: number;
   dedupeKey?: (row: unknown) => string;
   nonFatalStatuses?: number[];
+  queryParams?: Record<string, string | number | boolean>;
 }
 
 const dedupeRows = <T>(rows: T[], dedupeKey?: (row: unknown) => string): T[] => {
@@ -292,11 +307,19 @@ const fetchPaginated = async <T>(endpoint: string, wallet: string, options: Fetc
     url.searchParams.set("user", wallet);
     url.searchParams.set("limit", String(pageSize));
     url.searchParams.set("offset", String(offset));
+    for (const [key, value] of Object.entries(options.queryParams ?? {})) {
+      url.searchParams.set(key, String(value));
+    }
 
     const response = await fetch(url.toString(), { cache: "no-store" });
     if (!response.ok) {
       if (nonFatalStatuses.has(response.status)) {
-        break;
+        // Some Data API endpoints return 400 when offset exceeds the allowed max.
+        // Treat that as "end of pagination" only after at least one successful page.
+        if (page > 0) {
+          break;
+        }
+        throw new Error(`Polymarket API error (${response.status}) at ${endpoint}`);
       }
       throw new Error(`Polymarket API error (${response.status}) at ${endpoint}`);
     }
@@ -354,6 +377,76 @@ const getOutcomeKey = (trade: PolymarketTrade): string => {
   return trade.asset ?? trade.outcome ?? String(trade.outcomeIndex ?? "unknown-outcome");
 };
 
+const normalizePolymarketUrl = (value: string): string | null => {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return null;
+  }
+  if (trimmed.startsWith("https://polymarket.com/")) {
+    return trimmed;
+  }
+  if (trimmed.startsWith("http://polymarket.com/")) {
+    return `https://${trimmed.slice("http://".length)}`;
+  }
+  if (trimmed.startsWith("/event/")) {
+    return `https://polymarket.com${trimmed}`;
+  }
+  if (trimmed.startsWith("event/")) {
+    return `https://polymarket.com/${trimmed}`;
+  }
+  return null;
+};
+
+const looksLikeSlug = (value: string): boolean => /^[a-z0-9-]+$/i.test(value.trim());
+
+const buildPolymarketEventUrlFromSlugs = (eventSlugRaw: string, marketSlugRaw: string): string | null => {
+  const eventSlug = eventSlugRaw.trim();
+  const marketSlug = marketSlugRaw.trim();
+  if (!eventSlug || !marketSlug || !looksLikeSlug(eventSlug) || !looksLikeSlug(marketSlug)) {
+    return null;
+  }
+  return `https://polymarket.com/event/${eventSlug}/${marketSlug}`;
+};
+
+const getPolymarketEventUrlFromRecord = (record: Record<string, unknown>): string | null => {
+  const explicit = getStringFromKeys(record, [
+    "url",
+    "marketUrl",
+    "market_url",
+    "eventUrl",
+    "event_url",
+    "href",
+    "permalink",
+    "link"
+  ]);
+  const normalizedExplicit = explicit ? normalizePolymarketUrl(explicit) : null;
+  if (normalizedExplicit) {
+    return normalizedExplicit;
+  }
+
+  const eventSlug = getStringFromKeys(record, ["eventSlug", "event_slug", "event", "eventId", "event_id"]);
+  const marketSlug = getStringFromKeys(record, ["slug", "marketSlug", "market_slug"]);
+  const fullFromBoth = buildPolymarketEventUrlFromSlugs(eventSlug, marketSlug);
+  if (fullFromBoth) {
+    return fullFromBoth;
+  }
+
+  if (looksLikeSlug(marketSlug)) {
+    const fallback = buildPolymarketEventUrlFromSlugs(marketSlug, marketSlug);
+    if (fallback) {
+      return fallback;
+    }
+  }
+  if (looksLikeSlug(eventSlug)) {
+    const fallback = buildPolymarketEventUrlFromSlugs(eventSlug, eventSlug);
+    if (fallback) {
+      return fallback;
+    }
+  }
+
+  return null;
+};
+
 const normalizeTrade = (trade: PolymarketTrade): NormalizedTrade | null => {
   const sideRaw = (trade.side ?? "").toUpperCase();
   const side: NormalizedTrade["side"] = sideRaw === "BUY" ? "BUY" : sideRaw === "SELL" ? "SELL" : "OTHER";
@@ -407,10 +500,103 @@ const canonicalDirection = (outcomeKey: string): string => {
 
 const getPositionRealizedPnl = (position: PolymarketPosition): number => {
   const asRecord = position as Record<string, unknown>;
-  return (
-    toNumber(position.realizedPnl) ||
-    getNumberFromKeys(asRecord, ["pnl", "realizedPNL", "profit", "profitLoss", "cashPnl"])
-  );
+  const directRealized = toFiniteNumberOrNull(position.realizedPnl);
+  if (directRealized !== null) {
+    return directRealized;
+  }
+
+  const fallbackRealized = getNumberFromKeys(asRecord, ["realizedPNL", "pnl", "profit", "profitLoss"]);
+  if (fallbackRealized !== 0) {
+    return fallbackRealized;
+  }
+
+  return getNumberFromKeys(asRecord, ["cashPnl"]);
+};
+
+const getOpenPositionPnl = (position: PolymarketPosition): number => {
+  const asRecord = position as Record<string, unknown>;
+  const totalPnl = getNumberFromKeys(asRecord, ["totalPnl", "totalPNL", "positionPnl", "netPnl"]);
+  if (totalPnl !== 0) {
+    return totalPnl;
+  }
+
+  return toNumber(position.cashPnl);
+};
+
+const getActivityType = (activityRow: PolymarketActivity): string => {
+  const asRecord = activityRow as Record<string, unknown>;
+  return getStringFromKeys(asRecord, ["type", "activityType", "eventType"]).toUpperCase();
+};
+
+const getActivityAmountUsd = (activityRow: PolymarketActivity, candidateKeys: string[]): number => {
+  const asRecord = activityRow as Record<string, unknown>;
+  for (const key of candidateKeys) {
+    const value = toFiniteNumberOrNull(asRecord[key]);
+    if (value !== null) {
+      return Math.abs(value);
+    }
+  }
+  return 0;
+};
+
+const getActivityFeePaid = (activityRow: PolymarketActivity): number => {
+  const type = getActivityType(activityRow);
+  const explicitFee = getActivityAmountUsd(activityRow, [
+    "fee",
+    "feeUsd",
+    "feeUSDC",
+    "feeAmount",
+    "tradingFee",
+    "trading_fee",
+    "feesPaid",
+    "fees"
+  ]);
+  if (explicitFee > 0) {
+    return explicitFee;
+  }
+  if (type.includes("FEE")) {
+    return getActivityAmountUsd(activityRow, ["usdcSize", "amount", "value", "sizeUsd"]);
+  }
+  return 0;
+};
+
+const getActivityMakerRebate = (activityRow: PolymarketActivity): number => {
+  const type = getActivityType(activityRow);
+  if (!type.includes("REBATE")) {
+    return 0;
+  }
+  return getActivityAmountUsd(activityRow, [
+    "rebate",
+    "rebateUsd",
+    "rebateUSDC",
+    "makerRebate",
+    "maker_reward",
+    "usdcSize",
+    "amount"
+  ]);
+};
+
+const buildLatestMarketUrlByMarketTitle = (trades: PolymarketTrade[]): Map<string, string> => {
+  const best = new Map<string, { ts: number; url: string }>();
+
+  for (const trade of trades) {
+    const marketTitle = getMarketTitle(trade);
+    if (!marketTitle) {
+      continue;
+    }
+    const tradeRecord = trade as unknown as Record<string, unknown>;
+    const candidate = getPolymarketEventUrlFromRecord(tradeRecord);
+    if (!candidate) {
+      continue;
+    }
+    const ts = tryParseTimestampMs(trade.timestamp) ?? 0;
+    const current = best.get(marketTitle);
+    if (!current || ts >= current.ts) {
+      best.set(marketTitle, { ts, url: candidate });
+    }
+  }
+
+  return new Map(Array.from(best.entries()).map(([title, payload]) => [title, payload.url]));
 };
 
 const buildLatestTradeTimestampByMarket = (trades: PolymarketTrade[]): Map<string, number> => {
@@ -428,6 +614,7 @@ const buildLatestTradeTimestampByMarket = (trades: PolymarketTrade[]): Map<strin
 
 const buildClosedPairRows = (closedPositions: PolymarketPosition[], trades: PolymarketTrade[]) => {
   const latestTradeByMarket = buildLatestTradeTimestampByMarket(trades);
+  const marketUrlByTitle = buildLatestMarketUrlByMarketTitle(trades);
   const byMarket = new Map<string, ClosedPairAggregate>();
 
   for (const position of closedPositions) {
@@ -467,11 +654,14 @@ const buildClosedPairRows = (closedPositions: PolymarketPosition[], trades: Poly
           asRecord.endDate
       ) ?? 0;
     const closedAtMs = Math.max(closedAtCandidate, latestTradeByMarket.get(marketTitle) ?? 0);
+    const marketUrlFromPosition = getPolymarketEventUrlFromRecord(asRecord);
+    const marketUrlFallback = marketUrlByTitle.get(marketTitle) ?? null;
 
     if (!byMarket.has(marketTitle)) {
       byMarket.set(marketTitle, {
         marketTitle,
         closedAtMs,
+        marketUrl: marketUrlFromPosition ?? marketUrlFallback,
         legs: {
           UP: { units: 0, cost: 0, pnl: 0 },
           DOWN: { units: 0, cost: 0, pnl: 0 }
@@ -485,6 +675,11 @@ const buildClosedPairRows = (closedPositions: PolymarketPosition[], trades: Poly
     }
 
     aggregate.closedAtMs = Math.max(aggregate.closedAtMs, closedAtMs);
+    if (!aggregate.marketUrl && marketUrlFromPosition) {
+      aggregate.marketUrl = marketUrlFromPosition;
+    } else if (!aggregate.marketUrl && marketUrlFallback) {
+      aggregate.marketUrl = marketUrlFallback;
+    }
     aggregate.legs[direction].units += units;
     aggregate.legs[direction].cost += cost;
     aggregate.legs[direction].pnl += pnl;
@@ -529,6 +724,7 @@ const buildClosedPairRows = (closedPositions: PolymarketPosition[], trades: Poly
         closedAt: new Date(pair.closedAtMs > 0 ? pair.closedAtMs : Date.now()).toISOString(),
         eventTime: eventStartMs ? new Date(eventStartMs).toISOString() : null,
         marketTitle: pair.marketTitle,
+        marketUrl: pair.marketUrl,
         pairStatus,
         result,
         upUnits: up.units,
@@ -716,8 +912,10 @@ const buildPairExecutionFromClosedRows = (
 export const getPolymarketSummary = async (wallet: string): Promise<PolymarketSummary> => {
   const [trades, closedPositions, openPositions, activity] = await Promise.all([
     fetchPaginated<PolymarketTrade>("/trades", wallet, {
-      pageSize: 50,
-      maxOffset: 1000,
+      pageSize: 500,
+      maxOffset: 100_000,
+      nonFatalStatuses: [400],
+      queryParams: { takerOnly: false },
       dedupeKey: (row) => {
         const trade = row as PolymarketTrade;
         return (
@@ -743,17 +941,14 @@ export const getPolymarketSummary = async (wallet: string): Promise<PolymarketSu
   const estimatedFeesPaid =
     tradesWithFeeRate.length > 0 ? tradesWithFeeRate.reduce((total, trade) => total + estimateTradeFee(trade), 0) : null;
 
-  const makerRebates = activity.reduce((total, row) => {
-    const type = (row.type ?? "").toUpperCase();
-    if (!type.includes("REBATE")) {
-      return total;
-    }
-    return total + toNumber(row.usdcSize);
-  }, 0);
+  const makerRebates = activity.reduce((total, row) => total + getActivityMakerRebate(row), 0);
+  const feesPaidFromActivity = activity.reduce((total, row) => total + getActivityFeePaid(row), 0);
+  const appliedFeesPaid =
+    feesPaidFromActivity > 0 ? feesPaidFromActivity : estimatedFeesPaid !== null ? estimatedFeesPaid : 0;
 
   const realizedPnl = closedPositions.reduce((total, row) => total + getPositionRealizedPnl(row), 0);
-  const openPnl = openPositions.reduce((total, row) => total + toNumber(row.cashPnl), 0);
-  const netPnl = realizedPnl + openPnl;
+  const openPnl = openPositions.reduce((total, row) => total + getOpenPositionPnl(row), 0);
+  const netPnl = realizedPnl + openPnl - appliedFeesPaid + makerRebates;
 
   const wins = closedPositions.filter((row) => getPositionRealizedPnl(row) > 0).length;
   const losses = closedPositions.filter((row) => getPositionRealizedPnl(row) < 0).length;
@@ -787,9 +982,9 @@ export const getPolymarketSummary = async (wallet: string): Promise<PolymarketSu
     asOf: new Date().toISOString(),
     totalTrades: trades.length,
     totalVolumeUsd,
-    estimatedFeesPaid,
+    estimatedFeesPaid: appliedFeesPaid > 0 ? appliedFeesPaid : estimatedFeesPaid,
     makerRebates,
-    netEstimatedFees: estimatedFeesPaid === null ? null : estimatedFeesPaid - makerRebates,
+    netEstimatedFees: appliedFeesPaid > 0 ? appliedFeesPaid - makerRebates : estimatedFeesPaid === null ? null : estimatedFeesPaid - makerRebates,
     feeDataCoveragePct,
     realizedPnl,
     openPnl,
