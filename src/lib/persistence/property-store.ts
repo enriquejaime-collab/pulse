@@ -153,6 +153,23 @@ class SupabasePropertyStore implements PropertyStore {
     return mapPropertyRow(created[0] ?? {});
   }
 
+  async updateProperty(propertyId: string, input: { name?: string; description?: string | null }): Promise<StoredProperty> {
+    const patch: Record<string, unknown> = {};
+    if (typeof input.name === "string") {
+      patch.name = input.name;
+    }
+    if (Object.prototype.hasOwnProperty.call(input, "description")) {
+      patch.description = input.description ?? null;
+    }
+
+    const rows = await this.client.patch<Record<string, unknown>[]>(
+      `/properties?id=eq.${propertyId}`,
+      patch,
+      { Prefer: "return=representation" }
+    );
+    return mapPropertyRow(rows[0] ?? {});
+  }
+
   async upsertWallet(input: {
     propertyId: string;
     wallet: string;
@@ -339,6 +356,23 @@ class LocalFilePropertyStore implements PropertyStore {
       updatedAt: now
     };
     doc.properties.unshift(property);
+    await this.writeStore(doc);
+    return property;
+  }
+
+  async updateProperty(propertyId: string, input: { name?: string; description?: string | null }): Promise<StoredProperty> {
+    const doc = await this.readStore();
+    const property = doc.properties.find((row) => row.id === propertyId);
+    if (!property) {
+      throw new Error("Property not found.");
+    }
+    if (typeof input.name === "string" && input.name.trim()) {
+      property.name = input.name.trim();
+    }
+    if (Object.prototype.hasOwnProperty.call(input, "description")) {
+      property.description = input.description ?? null;
+    }
+    property.updatedAt = new Date().toISOString();
     await this.writeStore(doc);
     return property;
   }

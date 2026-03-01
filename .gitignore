@@ -18,3 +18,4 @@ pnpm-debug.log*
 
 coverage/
 *.tsbuildinfo
+.pulse-store.json

@@ -49,6 +49,7 @@ export interface PropertyWithWallets extends StoredProperty {
 export interface PropertyStore {
   listProperties(): Promise<PropertyWithWallets[]>;
   createProperty(name: string, description?: string | null): Promise<StoredProperty>;
+  updateProperty(propertyId: string, input: { name?: string; description?: string | null }): Promise<StoredProperty>;
   upsertWallet(input: {
     propertyId: string;
     wallet: string;

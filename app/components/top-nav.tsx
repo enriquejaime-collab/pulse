@@ -4,7 +4,8 @@ import { PulseLogo } from "@/app/components/pulse-logo";
 const navItems = [
   { href: "/dashboard", label: "Dashboard" },
   { href: "/imports", label: "Imports" },
-  { href: "/trades", label: "Trades" }
+  { href: "/trades", label: "Trades" },
+  { href: "/settings", label: "Settings" }
 ];
 
 export function TopNav() {

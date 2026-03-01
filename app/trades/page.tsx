@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import Link from "next/link";
 import { PageShell } from "@/app/components/page-shell";
 
 interface PolymarketSummaryResponse {
@@ -463,10 +464,7 @@ export default function TradesPage() {
   const [persistenceBackend, setPersistenceBackend] = useState<"supabase" | "local" | "unknown">("unknown");
   const [selectedPropertyId, setSelectedPropertyId] = useState("");
   const [selectedWalletId, setSelectedWalletId] = useState("");
-  const [newPropertyName, setNewPropertyName] = useState("");
-  const [walletLabelInput, setWalletLabelInput] = useState("");
   const [isPropertiesLoading, setIsPropertiesLoading] = useState(false);
-  const [isPropertyActionLoading, setIsPropertyActionLoading] = useState(false);
   const [lastSyncSource, setLastSyncSource] = useState<"live" | "cache" | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -690,7 +688,6 @@ export default function TradesPage() {
       const selectedWallet = walletsForProperty.find((wallet) => wallet.id === resolvedWalletId);
       if (selectedWallet) {
         setWalletInput(selectedWallet.wallet);
-        setWalletLabelInput(selectedWallet.label ?? "");
       }
       return nextProperties;
     } catch (loadError) {
@@ -740,68 +737,6 @@ export default function TradesPage() {
     }
     setQuickAnchorEndMs(floorToHourMs(Date.now()));
   }, [comparisonMode, comparisonDurationPreset, comparisonCustomHours]);
-
-  const onCreateProperty = async () => {
-    const name = newPropertyName.trim();
-    if (!name) {
-      setError("Enter a property name first.");
-      return;
-    }
-    setIsPropertyActionLoading(true);
-    setError(null);
-    try {
-      const response = await fetch("/api/properties", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name })
-      });
-      const payload = (await response.json()) as { property?: PersistedProperty; error?: string };
-      if (!response.ok || !payload.property) {
-        throw new Error(payload.error ?? "Failed to create property.");
-      }
-      setNewPropertyName("");
-      await loadProperties(payload.property.id);
-    } catch (createError) {
-      const message = createError instanceof Error ? createError.message : "Failed to create property.";
-      setError(message);
-    } finally {
-      setIsPropertyActionLoading(false);
-    }
-  };
-
-  const onSaveWalletToProperty = async () => {
-    const wallet = walletInput.trim().toLowerCase();
-    if (!selectedPropertyId) {
-      setError("Create or select a property first.");
-      return;
-    }
-    if (!wallet) {
-      setError("Enter a wallet address first.");
-      return;
-    }
-    setIsPropertyActionLoading(true);
-    setError(null);
-    try {
-      const response = await fetch(`/api/properties/${encodeURIComponent(selectedPropertyId)}/wallets`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          wallet,
-          label: walletLabelInput.trim() || null
-        })
-      });
-      const payload = (await response.json()) as { wallet?: PersistedWalletProfile; error?: string };
-      if (!response.ok || !payload.wallet) {
-        throw new Error(payload.error ?? "Failed to save wallet.");
-      }
-      await loadProperties(selectedPropertyId, payload.wallet.id);
-    } catch (saveError) {
-      const message = saveError instanceof Error ? saveError.message : "Failed to save wallet.";
-      setError(message);
-    } finally {
-      setIsPropertyActionLoading(false);
-    }
-  };
 
   const onLoadCachedSummary = async () => {
     const wallet = selectedWalletProfile?.wallet ?? walletInput.trim().toLowerCase();
@@ -919,7 +854,6 @@ export default function TradesPage() {
                   setSelectedWalletId(nextWallet?.id ?? "");
                   if (nextWallet) {
                     setWalletInput(nextWallet.wallet);
-                    setWalletLabelInput(nextWallet.label ?? "");
                   }
                 }}
                 className="mt-1.5 h-11 w-full rounded-lg border border-slate-300 bg-white px-3 text-sm text-slate-800"
@@ -942,7 +876,6 @@ export default function TradesPage() {
                   const wallet = selectedProperty?.wallets.find((row) => row.id === walletId);
                   if (wallet) {
                     setWalletInput(wallet.wallet);
-                    setWalletLabelInput(wallet.label ?? "");
                   }
                 }}
                 className="mt-1.5 h-11 w-full rounded-lg border border-slate-300 bg-white px-3 text-sm text-slate-800"
@@ -958,48 +891,23 @@ export default function TradesPage() {
             </div>
           </div>
 
-          <div className="mt-3 grid gap-3 lg:grid-cols-3">
-            <input
-              type="text"
-              placeholder="New property name"
-              value={newPropertyName}
-              onChange={(event) => setNewPropertyName(event.target.value)}
-              className="h-11 w-full rounded-lg border border-slate-300 bg-white px-3 text-sm text-slate-800"
-            />
-            <input
-              type="text"
-              placeholder="Wallet label (optional)"
-              value={walletLabelInput}
-              onChange={(event) => setWalletLabelInput(event.target.value)}
-              className="h-11 w-full rounded-lg border border-slate-300 bg-white px-3 text-sm text-slate-800"
-            />
-            <div className="flex flex-wrap gap-2">
-              <button
-                type="button"
-                onClick={onCreateProperty}
-                disabled={isPropertyActionLoading}
-                className="inline-flex h-11 items-center justify-center rounded-lg border border-slate-300 bg-white px-4 text-sm font-medium text-slate-800 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
-              >
-                Create Property
-              </button>
-              <button
-                type="button"
-                onClick={onSaveWalletToProperty}
-                disabled={isPropertyActionLoading || !selectedPropertyId}
-                className="inline-flex h-11 items-center justify-center rounded-lg border border-slate-300 bg-white px-4 text-sm font-medium text-slate-800 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
-              >
-                Save Wallet
-              </button>
-              <button
-                type="button"
-                onClick={onLoadCachedSummary}
-                disabled={isLoading || !selectedPropertyId}
-                className="inline-flex h-11 items-center justify-center rounded-lg border border-slate-300 bg-white px-4 text-sm font-medium text-slate-800 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
-              >
-                Load Cached
-              </button>
-            </div>
+          <div className="mt-3 flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={onLoadCachedSummary}
+              disabled={isLoading || !selectedPropertyId}
+              className="inline-flex h-11 items-center justify-center rounded-lg border border-slate-300 bg-white px-4 text-sm font-medium text-slate-800 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              Load Cached
+            </button>
+            <Link
+              href="/settings"
+              className="inline-flex h-11 items-center justify-center rounded-lg border border-slate-300 bg-white px-4 text-sm font-medium text-slate-800 transition hover:bg-slate-50"
+            >
+              Manage Properties
+            </Link>
           </div>
+          <p className="mt-2 text-xs text-slate-500">Load Cached uses the latest stored snapshot without calling the live API.</p>
 
           <p className="mt-3 text-xs text-slate-500">
             Persistence backend: <span className="font-medium text-slate-700">{persistenceBackend}</span>
