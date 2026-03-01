@@ -276,12 +276,15 @@ const computeEdgeDistribution = (rows: PolymarketSummaryResponse["closedPairRows
     .filter((row) => row.pairStatus === "Paired" && row.edge !== null)
     .map((row) => (row.edge ?? 0) * 100)
     .sort((a, b) => a - b);
+  const negativeCount = edgesCents.filter((value) => value < 0).length;
 
   return {
     sample: edgesCents.length,
+    min: edgesCents[0] ?? 0,
     p10: percentile(edgesCents, 10),
     p50: percentile(edgesCents, 50),
-    p90: percentile(edgesCents, 90)
+    p90: percentile(edgesCents, 90),
+    negativeRatePct: edgesCents.length > 0 ? (negativeCount / edgesCents.length) * 100 : 0
   };
 };
 
@@ -385,6 +388,7 @@ export default function TradesPage() {
   const [dateRangePreset, setDateRangePreset] = useState<DateRangePreset>("all");
   const [customStartDate, setCustomStartDate] = useState("");
   const [customEndDate, setCustomEndDate] = useState("");
+  const [tablePairFilter, setTablePairFilter] = useState<"all" | "missing" | "paired">("all");
   const [windowAStart, setWindowAStart] = useState("");
   const [windowAEnd, setWindowAEnd] = useState("");
   const [windowBStart, setWindowBStart] = useState("");
@@ -405,6 +409,16 @@ export default function TradesPage() {
       .filter((row) => isInDateRange(getRowTimeMs(row), startMs, endMs))
       .sort((a, b) => getRowTimeMs(b) - getRowTimeMs(a));
   }, [strategyClosedRows, dateRangePreset, customStartDate, customEndDate]);
+
+  const tableClosedRows = useMemo(() => {
+    if (tablePairFilter === "missing") {
+      return filteredClosedRows.filter((row) => row.pairStatus === "Missing Leg");
+    }
+    if (tablePairFilter === "paired") {
+      return filteredClosedRows.filter((row) => row.pairStatus === "Paired");
+    }
+    return filteredClosedRows;
+  }, [filteredClosedRows, tablePairFilter]);
 
   const closedAuditSummary = useMemo(() => {
     const missingLegs = filteredClosedRows.filter((row) => row.pairStatus === "Missing Leg").length;
@@ -471,7 +485,7 @@ export default function TradesPage() {
 
   useEffect(() => {
     setClosedRowsVisible(50);
-  }, [summary?.asOf, strategyFilter, customStrategyFilter, dateRangePreset, customStartDate, customEndDate]);
+  }, [summary?.asOf, strategyFilter, customStrategyFilter, dateRangePreset, customStartDate, customEndDate, tablePairFilter]);
 
   useEffect(() => {
     if (!summary) {
@@ -779,6 +793,10 @@ export default function TradesPage() {
                 </div>
                 <p className="mt-2 text-xs text-slate-500">Based on {filteredEdgeDistribution.sample} paired markets</p>
                 <p className="mt-1 text-xs text-slate-500">
+                  Min edge: {formatSignedCents(filteredEdgeDistribution.min)} | Negative-edge rate:{" "}
+                  {filteredEdgeDistribution.negativeRatePct.toFixed(1)}%
+                </p>
+                <p className="mt-1 text-xs text-slate-500">
                   Size-weighted edge: {formatSignedUsd(filteredPnlBridge.sizeWeightedEdgeUsd)} (
                   {formatSignedCents(filteredPnlBridge.sizeWeightedEdgeCentsPerMatchedUnit)} per matched unit)
                 </p>
@@ -1015,6 +1033,42 @@ export default function TradesPage() {
                 Closed pairs sorted by market event time (most recent first). This table is the source for filtered pair
                 metrics.
               </p>
+              <div className="mt-3 flex flex-wrap items-center gap-2 text-xs">
+                <span className="font-semibold uppercase tracking-wide text-slate-500">Table view</span>
+                <button
+                  type="button"
+                  onClick={() => setTablePairFilter("all")}
+                  className={`rounded-full border px-2.5 py-1 font-medium transition ${
+                    tablePairFilter === "all"
+                      ? "border-slate-300 bg-slate-100 text-slate-800"
+                      : "border-slate-200 bg-white text-slate-700 hover:border-slate-300"
+                  }`}
+                >
+                  All
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setTablePairFilter("missing")}
+                  className={`rounded-full border px-2.5 py-1 font-medium transition ${
+                    tablePairFilter === "missing"
+                      ? "border-amber-300 bg-amber-100 text-amber-900"
+                      : "border-amber-200 bg-amber-50 text-amber-800 hover:border-amber-300"
+                  }`}
+                >
+                  Missing Leg only
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setTablePairFilter("paired")}
+                  className={`rounded-full border px-2.5 py-1 font-medium transition ${
+                    tablePairFilter === "paired"
+                      ? "border-emerald-300 bg-emerald-100 text-emerald-900"
+                      : "border-emerald-200 bg-emerald-50 text-emerald-800 hover:border-emerald-300"
+                  }`}
+                >
+                  Paired only
+                </button>
+              </div>
             </div>
             <div className="sticky top-[5.25rem] z-10 border-y border-slate-200/80 bg-white/90 px-4 py-2 backdrop-blur-sm sm:px-5">
               <div className="flex flex-wrap items-center gap-2 text-xs">
@@ -1051,7 +1105,7 @@ export default function TradesPage() {
                   </tr>
                 </thead>
                 <tbody>
-                  {filteredClosedRows.slice(0, closedRowsVisible).map((row) => (
+                  {tableClosedRows.slice(0, closedRowsVisible).map((row) => (
                     <tr key={row.id} className="odd:bg-white even:bg-slate-50/60">
                       <td className="border-b border-slate-100 pl-4 pr-2 py-2 text-slate-700">
                         <p>{new Date(row.eventTime ?? row.closedAt).toLocaleDateString()}</p>
@@ -1128,7 +1182,7 @@ export default function TradesPage() {
             </div>
             <div className="flex flex-wrap items-center justify-between gap-2 border-t border-slate-200/80 px-6 py-3 text-sm">
               <p className="text-slate-600">
-                Showing {Math.min(closedRowsVisible, filteredClosedRows.length)} of {filteredClosedRows.length} pairs
+                Showing {Math.min(closedRowsVisible, tableClosedRows.length)} of {tableClosedRows.length} pairs
               </p>
               <p className="text-xs text-slate-500">
                 Wallet {summary.wallet.slice(0, 8)}...{summary.wallet.slice(-4)} · As of{" "}
@@ -1144,7 +1198,7 @@ export default function TradesPage() {
                     Show less
                   </button>
                 )}
-                {closedRowsVisible < filteredClosedRows.length && (
+                {closedRowsVisible < tableClosedRows.length && (
                   <button
                     type="button"
                     onClick={() => setClosedRowsVisible((current) => current + 50)}
