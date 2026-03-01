@@ -86,7 +86,7 @@ const formatUsd = (value: number): string =>
 const formatSignedUsd = (value: number): string => `${value >= 0 ? "+" : "-"}${formatUsd(Math.abs(value))}`;
 const formatSignedCents = (value: number): string => `${value >= 0 ? "+" : "-"}${Math.abs(value).toFixed(2)}c`;
 const formatAvgPriceCents = (value: number | null): string => (value === null ? "-" : `${Math.round(value * 100)}c`);
-type DateRangePreset = "all" | "24h" | "7d" | "30d" | "month_to_date" | "last_month" | "custom";
+type DateRangePreset = "all" | "12h" | "24h" | "7d" | "30d" | "month_to_date" | "last_month" | "custom";
 type AbDurationPreset = "1h" | "3h" | "6h" | "12h" | "24h" | "custom";
 const MARKET_TIME_ZONE = "America/New_York";
 
@@ -171,6 +171,9 @@ const getDateRangeBounds = (
   if (preset === "24h") {
     return { startMs: nowMs - 24 * 60 * 60 * 1000, endMs: nowMs };
   }
+  if (preset === "12h") {
+    return { startMs: nowMs - 12 * 60 * 60 * 1000, endMs: nowMs };
+  }
   if (preset === "7d") {
     return { startMs: nowMs - 7 * 24 * 60 * 60 * 1000, endMs: nowMs };
   }
@@ -252,6 +255,9 @@ const getDatePresetLabel = (
 ): string => {
   if (preset === "24h") {
     return "Past 24 hours";
+  }
+  if (preset === "12h") {
+    return "Past 12 hours";
   }
   if (preset === "7d") {
     return "Past 7 days";
@@ -806,6 +812,7 @@ export default function TradesPage() {
                     className="h-11 w-full rounded-lg border border-slate-300 bg-white px-3 text-sm text-slate-800 sm:w-[13rem]"
                   >
                     <option value="all">All time</option>
+                    <option value="12h">Past 12 hours</option>
                     <option value="24h">Past 24 hours</option>
                     <option value="7d">Past 7 days</option>
                     <option value="30d">Past 30 days</option>
@@ -858,7 +865,15 @@ export default function TradesPage() {
               </span>
             </div>
 
-            <p className="mt-4 rounded-xl border border-emerald-200 bg-emerald-50/70 px-3 py-2 text-xs text-emerald-700">
+            <p
+              className={`mt-4 rounded-xl px-3 py-2 text-xs ${
+                filteredPnlBridge.netPnl > 0
+                  ? "border border-emerald-200 bg-emerald-50/70 text-emerald-700"
+                  : filteredPnlBridge.netPnl < 0
+                    ? "border border-red-200 bg-red-50/70 text-red-700"
+                    : "border border-slate-200 bg-slate-50/80 text-slate-700"
+              }`}
+            >
               Net P/L {formatSignedUsd(filteredPnlBridge.netPnl)} = wins {formatSignedUsd(filteredPnlBridge.grossWins)} +
               losses {formatSignedUsd(filteredPnlBridge.grossLosses)} · missing-leg P/L{" "}
               {formatSignedUsd(filteredPnlBridge.missingLegPnl)}
