@@ -161,6 +161,17 @@ const toNumber = (value: unknown): number => {
   return 0;
 };
 
+const toFiniteNumberOrNull = (value: unknown): number | null => {
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? value : null;
+  }
+  if (typeof value === "string") {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
+};
+
 const toTimestampMs = (value: unknown): number => {
   const parsed = tryParseTimestampMs(value);
   return parsed ?? Date.now();
@@ -488,10 +499,27 @@ const canonicalDirection = (outcomeKey: string): string => {
 
 const getPositionRealizedPnl = (position: PolymarketPosition): number => {
   const asRecord = position as Record<string, unknown>;
-  return (
-    toNumber(position.realizedPnl) ||
-    getNumberFromKeys(asRecord, ["pnl", "realizedPNL", "profit", "profitLoss", "cashPnl"])
-  );
+  const directRealized = toFiniteNumberOrNull(position.realizedPnl);
+  if (directRealized !== null) {
+    return directRealized;
+  }
+
+  const fallbackRealized = getNumberFromKeys(asRecord, ["realizedPNL", "pnl", "profit", "profitLoss"]);
+  if (fallbackRealized !== 0) {
+    return fallbackRealized;
+  }
+
+  return getNumberFromKeys(asRecord, ["cashPnl"]);
+};
+
+const getOpenPositionPnl = (position: PolymarketPosition): number => {
+  const asRecord = position as Record<string, unknown>;
+  const totalPnl = getNumberFromKeys(asRecord, ["totalPnl", "totalPNL", "positionPnl", "netPnl"]);
+  if (totalPnl !== 0) {
+    return totalPnl;
+  }
+
+  return toNumber(position.cashPnl);
 };
 
 const buildLatestMarketUrlByMarketTitle = (trades: PolymarketTrade[]): Map<string, string> => {
@@ -868,7 +896,7 @@ export const getPolymarketSummary = async (wallet: string): Promise<PolymarketSu
   }, 0);
 
   const realizedPnl = closedPositions.reduce((total, row) => total + getPositionRealizedPnl(row), 0);
-  const openPnl = openPositions.reduce((total, row) => total + toNumber(row.cashPnl), 0);
+  const openPnl = openPositions.reduce((total, row) => total + getOpenPositionPnl(row), 0);
   const netPnl = realizedPnl + openPnl;
 
   const wins = closedPositions.filter((row) => getPositionRealizedPnl(row) > 0).length;
