@@ -4,8 +4,13 @@ import { TopNav } from "@/app/components/top-nav";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Ledger | Trade Tracker",
-  description: "Local-first trade normalization and analytics dashboard"
+  title: "Pulse",
+  description: "Your portfolio vitals.",
+  icons: {
+    icon: "/icon.svg",
+    shortcut: "/icon.svg",
+    apple: "/icon.svg"
+  }
 };
 
 interface RootLayoutProps {

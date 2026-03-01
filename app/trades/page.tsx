@@ -177,6 +177,49 @@ const matchesStrategy = (marketTitle: string, strategy: string, customFilter: st
   return true;
 };
 
+const getStrategyLabel = (strategy: "all" | "btc_updown" | "eth_updown" | "custom", customFilter: string): string => {
+  if (strategy === "btc_updown") {
+    return "Bitcoin Up or Down";
+  }
+  if (strategy === "eth_updown") {
+    return "Ethereum Up or Down";
+  }
+  if (strategy === "custom") {
+    const text = customFilter.trim();
+    return text ? `Custom: ${text}` : "Custom";
+  }
+  return "All closed markets";
+};
+
+const getDatePresetLabel = (
+  preset: DateRangePreset,
+  customStartDate: string,
+  customEndDate: string
+): string => {
+  if (preset === "24h") {
+    return "Past 24 hours";
+  }
+  if (preset === "7d") {
+    return "Past 7 days";
+  }
+  if (preset === "30d") {
+    return "Past 30 days";
+  }
+  if (preset === "month_to_date") {
+    return "Month to date";
+  }
+  if (preset === "last_month") {
+    return "Last month";
+  }
+  if (preset === "custom") {
+    if (customStartDate && customEndDate) {
+      return `${customStartDate} to ${customEndDate}`;
+    }
+    return "Custom range";
+  }
+  return "All time";
+};
+
 const computePairExecutionFromClosedRows = (rows: PolymarketSummaryResponse["closedPairRows"]) => {
   const activeMarkets = rows.length;
   const pairedMarkets = rows.filter((row) => row.pairStatus === "Paired").length;
@@ -253,6 +296,55 @@ const computeMissingLegImpact = (rows: PolymarketSummaryResponse["closedPairRows
   return { count, notional, exposureShares, netPnl, worstLoss };
 };
 
+const computePnlBridge = (rows: PolymarketSummaryResponse["closedPairRows"]) => {
+  let netPnl = 0;
+  let grossWins = 0;
+  let grossLosses = 0;
+  let pairedPnl = 0;
+  let missingLegPnl = 0;
+  let worstLoss = 0;
+  let sizeWeightedEdgeUsd = 0;
+  let matchedUnits = 0;
+
+  for (const row of rows) {
+    netPnl += row.netPnl;
+
+    if (row.netPnl > 0) {
+      grossWins += row.netPnl;
+    } else if (row.netPnl < 0) {
+      grossLosses += row.netPnl;
+      worstLoss = Math.min(worstLoss, row.netPnl);
+    }
+
+    if (row.pairStatus === "Paired") {
+      pairedPnl += row.netPnl;
+      if (row.edge !== null) {
+        const matched = Math.min(row.upUnits, row.downUnits);
+        if (matched > 0) {
+          matchedUnits += matched;
+          sizeWeightedEdgeUsd += row.edge * matched;
+        }
+      }
+    } else {
+      missingLegPnl += row.netPnl;
+    }
+  }
+
+  const sizeWeightedEdgeCentsPerMatchedUnit = matchedUnits > 0 ? (sizeWeightedEdgeUsd / matchedUnits) * 100 : 0;
+
+  return {
+    netPnl,
+    grossWins,
+    grossLosses,
+    pairedPnl,
+    missingLegPnl,
+    worstLoss,
+    sizeWeightedEdgeUsd,
+    matchedUnits,
+    sizeWeightedEdgeCentsPerMatchedUnit
+  };
+};
+
 const computeWindowMetrics = (rows: PolymarketSummaryResponse["closedPairRows"]) => {
   const pair = computePairExecutionFromClosedRows(rows);
   const edges = computeEdgeDistribution(rows);
@@ -297,6 +389,7 @@ export default function TradesPage() {
   const [windowAEnd, setWindowAEnd] = useState("");
   const [windowBStart, setWindowBStart] = useState("");
   const [windowBEnd, setWindowBEnd] = useState("");
+  const [isAllTimeSummaryOpen, setIsAllTimeSummaryOpen] = useState(true);
   const [isIterationComparisonOpen, setIsIterationComparisonOpen] = useState(false);
 
   const strategyClosedRows = useMemo(() => {
@@ -308,9 +401,9 @@ export default function TradesPage() {
 
   const filteredClosedRows = useMemo(() => {
     const { startMs, endMs } = getDateRangeBounds(dateRangePreset, customStartDate, customEndDate);
-    return strategyClosedRows.filter((row) =>
-      isInDateRange(getRowTimeMs(row), startMs, endMs)
-    );
+    return strategyClosedRows
+      .filter((row) => isInDateRange(getRowTimeMs(row), startMs, endMs))
+      .sort((a, b) => getRowTimeMs(b) - getRowTimeMs(a));
   }, [strategyClosedRows, dateRangePreset, customStartDate, customEndDate]);
 
   const closedAuditSummary = useMemo(() => {
@@ -329,6 +422,10 @@ export default function TradesPage() {
   );
   const filteredMissingImpact = useMemo(
     () => computeMissingLegImpact(filteredClosedRows),
+    [filteredClosedRows]
+  );
+  const filteredPnlBridge = useMemo(
+    () => computePnlBridge(filteredClosedRows),
     [filteredClosedRows]
   );
 
@@ -363,6 +460,15 @@ export default function TradesPage() {
     [windowAMetrics, windowBMetrics]
   );
 
+  const strategyFilterLabel = useMemo(
+    () => getStrategyLabel(strategyFilter, customStrategyFilter),
+    [strategyFilter, customStrategyFilter]
+  );
+  const dateRangeLabel = useMemo(
+    () => getDatePresetLabel(dateRangePreset, customStartDate, customEndDate),
+    [dateRangePreset, customStartDate, customEndDate]
+  );
+
   useEffect(() => {
     setClosedRowsVisible(50);
   }, [summary?.asOf, strategyFilter, customStrategyFilter, dateRangePreset, customStartDate, customEndDate]);
@@ -385,7 +491,7 @@ export default function TradesPage() {
     setWindowAEnd(toDateInput(aEnd));
     setWindowBStart(toDateInput(bStart));
     setWindowBEnd(toDateInput(bEnd));
-  }, [summary?.asOf, strategyFilter, customStrategyFilter]);
+  }, [summary, summary?.asOf, strategyFilter, customStrategyFilter]);
 
   const onFetchSummary = async () => {
     const wallet = walletInput.trim();
@@ -424,7 +530,7 @@ export default function TradesPage() {
   return (
     <PageShell
       title="Trades"
-      subtitle="Pull your Polymarket trading stats directly from API data for P/L, trades, win/loss, and fee estimates."
+      subtitle="Pull your Polymarket trading stats directly from API data for P/L, trades, win/loss, and pair execution."
       showHeader={false}
     >
       <section className="glass-panel rounded-3xl p-6 sm:p-8">
@@ -445,9 +551,9 @@ export default function TradesPage() {
             type="button"
             onClick={onFetchSummary}
             disabled={isLoading}
-            className="rounded-xl border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-800 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
+            className="inline-flex items-center justify-center rounded-xl border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-800 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
           >
-            {isLoading ? "Loading..." : "Fetch Summary"}
+            {isLoading ? "Loading..." : "Fetch"}
           </button>
         </div>
 
@@ -456,120 +562,266 @@ export default function TradesPage() {
 
       {summary && (
         <>
-          <section className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-            <article className="glass-panel rounded-2xl p-5">
-              <p className="text-xs font-medium uppercase tracking-wide text-slate-500">Net P/L</p>
-              <p className={`mt-2 text-2xl font-semibold ${metricColor(summary.netPnl)}`}>
-                {formatSignedUsd(summary.netPnl)}
-              </p>
-              <p className="mt-1 text-xs text-slate-500">
-                Realized {formatSignedUsd(summary.realizedPnl)} | Open {formatSignedUsd(summary.openPnl)}
-              </p>
-            </article>
+          <section className="glass-panel overflow-hidden rounded-2xl">
+            <button
+              type="button"
+              onClick={() => setIsAllTimeSummaryOpen((open) => !open)}
+              aria-expanded={isAllTimeSummaryOpen}
+              className="flex w-full items-center justify-between px-5 py-4 text-left"
+            >
+              <div>
+                <h3 className="text-sm font-semibold uppercase tracking-wide text-slate-600">All-time Summary</h3>
+                <p className="mt-1 text-xs text-slate-500">
+                  {summary.totalTrades.toLocaleString()} trades · {formatUsd(summary.totalVolumeUsd)} volume
+                </p>
+              </div>
+              <span className="text-xs font-medium text-slate-600">{isAllTimeSummaryOpen ? "Collapse" : "Expand"}</span>
+            </button>
 
-            <article className="glass-panel rounded-2xl p-5">
-              <p className="text-xs font-medium uppercase tracking-wide text-slate-500">Win / Loss</p>
-              <p className="mt-2 text-2xl font-semibold text-slate-900">
-                {summary.wins} / {summary.losses}
-              </p>
-              <p className="mt-1 text-xs text-slate-500">
-                Win rate: {summary.winRate.toFixed(1)}% | Breakeven: {summary.breakeven}
-              </p>
-            </article>
+            {isAllTimeSummaryOpen && (
+              <div className="border-t border-slate-200/80 p-5">
+                <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+                  <article className="rounded-xl border border-slate-200/90 bg-white/70 p-4">
+                    <p className="text-xs font-medium uppercase tracking-wide text-slate-500">Net P/L</p>
+                    <p className={`mt-2 text-2xl font-semibold ${metricColor(summary.netPnl)}`}>
+                      {formatSignedUsd(summary.netPnl)}
+                    </p>
+                    <p className="mt-1 text-xs text-slate-500">
+                      Realized {formatSignedUsd(summary.realizedPnl)} | Open {formatSignedUsd(summary.openPnl)}
+                    </p>
+                  </article>
 
-            <article className="glass-panel rounded-2xl p-5">
-              <p className="text-xs font-medium uppercase tracking-wide text-slate-500">Total Trades</p>
-              <p className="mt-2 text-2xl font-semibold text-slate-900">{summary.totalTrades}</p>
-              <p className="mt-1 text-xs text-slate-500">Volume: {formatUsd(summary.totalVolumeUsd)}</p>
-            </article>
+                  <article className="rounded-xl border border-slate-200/90 bg-white/70 p-4">
+                    <p className="text-xs font-medium uppercase tracking-wide text-slate-500">Win / Loss</p>
+                    <p className="mt-2 text-2xl font-semibold text-slate-900">
+                      {summary.wins} / {summary.losses}
+                    </p>
+                    <p className="mt-1 text-xs text-slate-500">
+                      Win rate: {summary.winRate.toFixed(1)}% | Breakeven: {summary.breakeven}
+                    </p>
+                  </article>
+
+                  <article className="rounded-xl border border-slate-200/90 bg-white/70 p-4">
+                    <p className="text-xs font-medium uppercase tracking-wide text-slate-500">Total Trades</p>
+                    <p className="mt-2 text-2xl font-semibold text-slate-900">{summary.totalTrades.toLocaleString()}</p>
+                    <p className="mt-1 text-xs text-slate-500">Volume: {formatUsd(summary.totalVolumeUsd)}</p>
+                  </article>
+                </div>
+
+                <p className="mt-4 rounded-xl border border-slate-200/80 bg-white/75 px-3 py-2 text-xs text-slate-600">
+                  Definitions: <span className="font-medium text-slate-700">Total Trades</span> is raw fills from{" "}
+                  <code>/trades</code>. <span className="font-medium text-slate-700">Pair Execution markets</span> are
+                  unique market events in closed pairs after current filters.
+                </p>
+              </div>
+            )}
           </section>
 
-          <section className="rounded-xl border border-slate-200/80 bg-white/70 px-4 py-3 text-xs text-slate-600">
-            <p>
-              Definitions: <span className="font-medium text-slate-700">Total Trades</span> is raw fills from{" "}
-              <code>/trades</code>. <span className="font-medium text-slate-700">Pair Execution markets</span> are
-              unique market events in closed pairs after current strategy/date filters.
-            </p>
+          <section className="glass-panel rounded-2xl p-5">
+            <p className="text-xs font-semibold uppercase tracking-wide text-slate-600">Filter Controls</p>
+            <h3 className="mt-1 text-xl font-semibold tracking-tight text-slate-900">Select your analysis window</h3>
+
+            <div className="mt-4 flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-end sm:gap-4">
+              <div className="sm:w-auto">
+                <label className="text-xs font-medium uppercase tracking-wide text-slate-500">Strategy</label>
+                <div className="mt-1.5 flex flex-col gap-2 sm:flex-row sm:items-center">
+                  <select
+                    value={strategyFilter}
+                    onChange={(event) =>
+                      setStrategyFilter(event.target.value as "all" | "btc_updown" | "eth_updown" | "custom")
+                    }
+                    className="w-full rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-800 sm:w-[18rem]"
+                  >
+                    <option value="all">All closed markets</option>
+                    <option value="btc_updown">Bitcoin Up or Down only</option>
+                    <option value="eth_updown">Ethereum Up or Down only</option>
+                    <option value="custom">Custom market text</option>
+                  </select>
+                  {strategyFilter === "custom" && (
+                    <input
+                      type="text"
+                      value={customStrategyFilter}
+                      onChange={(event) => setCustomStrategyFilter(event.target.value)}
+                      placeholder="e.g. Bitcoin Up or Down"
+                      className="w-full rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-800 sm:w-[18rem]"
+                    />
+                  )}
+                </div>
+              </div>
+
+              <div className="sm:w-auto">
+                <label className="text-xs font-medium uppercase tracking-wide text-slate-500">Date</label>
+                <div className="mt-1.5 flex flex-col gap-2 sm:flex-row sm:items-center">
+                  <select
+                    value={dateRangePreset}
+                    onChange={(event) => setDateRangePreset(event.target.value as DateRangePreset)}
+                    className="w-full rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-800 sm:w-[13rem]"
+                  >
+                    <option value="all">All time</option>
+                    <option value="24h">Past 24 hours</option>
+                    <option value="7d">Past 7 days</option>
+                    <option value="30d">Past 30 days</option>
+                    <option value="month_to_date">Month to date</option>
+                    <option value="last_month">Last month</option>
+                    <option value="custom">Custom range</option>
+                  </select>
+                  {dateRangePreset === "custom" && (
+                    <>
+                      <input
+                        type="date"
+                        value={customStartDate}
+                        onChange={(event) => setCustomStartDate(event.target.value)}
+                        className="w-full rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-800"
+                      />
+                      <span className="text-xs text-slate-500">to</span>
+                      <input
+                        type="date"
+                        value={customEndDate}
+                        onChange={(event) => setCustomEndDate(event.target.value)}
+                        className="w-full rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-800"
+                      />
+                    </>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            <div className="mt-4 flex flex-wrap gap-2 text-xs">
+              <span className="rounded-full border border-slate-200 bg-white px-2.5 py-1 font-medium text-slate-700">
+                {filteredClosedRows.length.toLocaleString()} markets
+              </span>
+              <span className="rounded-full border border-amber-200 bg-amber-50 px-2.5 py-1 font-medium text-amber-800">
+                {closedAuditSummary.missingLegs.toLocaleString()} missing legs
+              </span>
+              <span className="rounded-full border border-slate-200 bg-white px-2.5 py-1 font-medium text-slate-700">
+                {closedAuditSummary.flagged.toLocaleString()} flagged rows
+              </span>
+            </div>
           </section>
 
           <section className="glass-panel rounded-2xl p-5">
             <div className="flex flex-wrap items-center justify-between gap-2">
-              <h3 className="text-sm font-semibold uppercase tracking-wide text-slate-600">Pair Execution</h3>
-              <p className="text-xs text-slate-500">Sample: {filteredClosedRows.length} markets (current filters)</p>
+              <div>
+                <p className="text-xs font-semibold uppercase tracking-wide text-slate-600">Pair Execution</p>
+                <h3 className="mt-1 text-2xl font-semibold tracking-tight text-slate-900">Pair Execution Metrics</h3>
+              </div>
+              <span className="rounded-full border border-emerald-200 bg-emerald-50 px-2.5 py-1 text-xs font-semibold text-emerald-700">
+                Live · Filtered
+              </span>
             </div>
-            <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+
+            <p className="mt-4 rounded-xl border border-emerald-200 bg-emerald-50/70 px-3 py-2 text-xs text-emerald-700">
+              Net P/L {formatSignedUsd(filteredPnlBridge.netPnl)} = wins {formatSignedUsd(filteredPnlBridge.grossWins)} +
+              losses {formatSignedUsd(filteredPnlBridge.grossLosses)} · missing-leg P/L{" "}
+              {formatSignedUsd(filteredPnlBridge.missingLegPnl)}
+            </p>
+
+            <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
               <div className="rounded-xl border border-slate-200/90 bg-white/70 p-4">
-                <p className="text-xs uppercase tracking-wide text-slate-500">Gross Edge Captured</p>
-                <p className={`mt-2 text-xl font-semibold ${metricColor(filteredPairExecution.grossEdgeUsd)}`}>
+                <p className="text-xs uppercase tracking-wide text-slate-500">Theoretical Edge (1x)</p>
+                <p className={`mt-1 text-2xl font-semibold ${metricColor(filteredPairExecution.grossEdgeUsd)}`}>
                   {formatSignedUsd(filteredPairExecution.grossEdgeUsd)}
                 </p>
-                <p className="mt-1 text-xs text-slate-500">
-                  Avg combo cost: {filteredPairExecution.avgComboCost.toFixed(4)} | Avg edge:{" "}
-                  {formatSignedCents(filteredPairExecution.avgGrossEdgeCentsPerPair)} per paired market (
-                  {filteredPairExecution.avgGrossEdgeBps.toFixed(1)} bps)
-                </p>
+                <p className="mt-1 text-xs text-slate-500">1 unit per paired market</p>
               </div>
 
               <div className="rounded-xl border border-slate-200/90 bg-white/70 p-4">
                 <p className="text-xs uppercase tracking-wide text-slate-500">Pair Completion</p>
-                <p className="mt-2 text-xl font-semibold text-slate-900">
+                <p className="mt-1 text-2xl font-semibold text-slate-900">
                   {filteredPairExecution.completionRatePct.toFixed(1)}%
                 </p>
                 <p className="mt-1 text-xs text-slate-500">
-                  Paired markets {filteredPairExecution.pairedMarkets} / Active markets{" "}
-                  {filteredPairExecution.activeMarkets}
+                  {filteredPairExecution.pairedMarkets} paired / {filteredPairExecution.activeMarkets} active
                 </p>
               </div>
 
               <div className="rounded-xl border border-slate-200/90 bg-white/70 p-4">
-                <p className="text-xs uppercase tracking-wide text-slate-500">Positive Edge Matches</p>
-                <p className="mt-2 text-xl font-semibold text-slate-900">
+                <p className="text-xs uppercase tracking-wide text-slate-500">Positive Edge</p>
+                <p className="mt-1 text-2xl font-semibold text-slate-900">
                   {filteredPairExecution.positiveEdgeRatePct.toFixed(1)}%
                 </p>
-                <p className="mt-1 text-xs text-slate-500">
-                  Out of {filteredPairExecution.pairedMarkets} paired markets
-                </p>
+                <p className="mt-1 text-xs text-slate-500">Among paired markets only</p>
               </div>
 
+              <div className="rounded-xl border border-slate-200/90 bg-white/70 p-4">
+                <p className="text-xs uppercase tracking-wide text-slate-500">Missing Leg P/L</p>
+                <p className={`mt-1 text-2xl font-semibold ${metricColor(filteredPnlBridge.missingLegPnl)}`}>
+                  {formatSignedUsd(filteredPnlBridge.missingLegPnl)}
+                </p>
+                <p className="mt-1 text-xs text-slate-500">{filteredMissingImpact.count} missing legs</p>
+              </div>
+
+              <div className="rounded-xl border border-slate-200/90 bg-white/70 p-4">
+                <p className="text-xs uppercase tracking-wide text-slate-500">Net P/L (Period)</p>
+                <p className={`mt-1 text-2xl font-semibold ${metricColor(filteredPnlBridge.netPnl)}`}>
+                  {formatSignedUsd(filteredPnlBridge.netPnl)}
+                </p>
+                <p className="mt-1 text-xs text-slate-500">All filtered closed pairs</p>
+              </div>
+            </div>
+
+            <div className="mt-3 grid gap-3 lg:grid-cols-2">
               <div className="rounded-xl border border-slate-200/90 bg-white/70 p-4">
                 <p className="text-xs uppercase tracking-wide text-slate-500">Edge Distribution (Cents)</p>
                 <div className="mt-2 grid grid-cols-3 gap-2">
                   <div className="rounded-lg border border-slate-200/80 bg-white/80 px-2 py-2 text-center">
                     <p className="text-[11px] uppercase tracking-wide text-slate-500">p10</p>
-                    <p className="mt-1 text-sm font-semibold text-slate-800">{formatSignedCents(filteredEdgeDistribution.p10)}</p>
+                    <p className="mt-1 text-lg font-semibold text-slate-800">{formatSignedCents(filteredEdgeDistribution.p10)}</p>
                   </div>
                   <div className="rounded-lg border border-slate-200/80 bg-white/80 px-2 py-2 text-center">
                     <p className="text-[11px] uppercase tracking-wide text-slate-500">p50</p>
-                    <p className="mt-1 text-sm font-semibold text-slate-800">{formatSignedCents(filteredEdgeDistribution.p50)}</p>
+                    <p className="mt-1 text-lg font-semibold text-slate-800">{formatSignedCents(filteredEdgeDistribution.p50)}</p>
                   </div>
                   <div className="rounded-lg border border-slate-200/80 bg-white/80 px-2 py-2 text-center">
                     <p className="text-[11px] uppercase tracking-wide text-slate-500">p90</p>
-                    <p className="mt-1 text-sm font-semibold text-slate-800">{formatSignedCents(filteredEdgeDistribution.p90)}</p>
+                    <p className="mt-1 text-lg font-semibold text-slate-800">{formatSignedCents(filteredEdgeDistribution.p90)}</p>
                   </div>
                 </div>
                 <p className="mt-2 text-xs text-slate-500">Based on {filteredEdgeDistribution.sample} paired markets</p>
+                <p className="mt-1 text-xs text-slate-500">
+                  Size-weighted edge: {formatSignedUsd(filteredPnlBridge.sizeWeightedEdgeUsd)} (
+                  {formatSignedCents(filteredPnlBridge.sizeWeightedEdgeCentsPerMatchedUnit)} per matched unit)
+                </p>
               </div>
 
-              <div className="rounded-xl border border-slate-200/90 bg-white/70 p-4 sm:col-span-2 lg:col-span-2">
-                <p className="text-xs uppercase tracking-wide text-slate-500">Missing Leg Impact</p>
-                <div className="mt-2 grid gap-2 sm:grid-cols-2">
+              <div className="rounded-xl border border-slate-200/90 bg-white/70 p-4">
+                <p className="text-xs uppercase tracking-wide text-slate-500">P/L Bridge (Filtered)</p>
+                <div className="mt-2 grid grid-cols-2 gap-3">
                   <div>
-                    <p className="text-[11px] uppercase tracking-wide text-slate-500">Missing-leg P/L</p>
-                    <p className={`mt-1 text-xl font-semibold ${metricColor(filteredMissingImpact.netPnl)}`}>
-                      {formatSignedUsd(filteredMissingImpact.netPnl)}
+                    <p className="text-[11px] uppercase tracking-wide text-slate-500">Gross wins</p>
+                    <p className={`mt-1 text-lg font-semibold ${metricColor(filteredPnlBridge.grossWins)}`}>
+                      {formatSignedUsd(filteredPnlBridge.grossWins)}
                     </p>
                   </div>
                   <div>
-                    <p className="text-[11px] uppercase tracking-wide text-slate-500">Worst Single Loss</p>
-                    <p className={`mt-1 text-xl font-semibold ${metricColor(filteredMissingImpact.worstLoss)}`}>
-                      {formatSignedUsd(filteredMissingImpact.worstLoss)}
+                    <p className="text-[11px] uppercase tracking-wide text-slate-500">Gross losses</p>
+                    <p className={`mt-1 text-lg font-semibold ${metricColor(filteredPnlBridge.grossLosses)}`}>
+                      {formatSignedUsd(filteredPnlBridge.grossLosses)}
+                    </p>
+                  </div>
+                  <div>
+                    <p className="text-[11px] uppercase tracking-wide text-slate-500">Paired P/L</p>
+                    <p className={`mt-1 text-lg font-semibold ${metricColor(filteredPnlBridge.pairedPnl)}`}>
+                      {formatSignedUsd(filteredPnlBridge.pairedPnl)}
+                    </p>
+                  </div>
+                  <div>
+                    <p className="text-[11px] uppercase tracking-wide text-slate-500">Worst single loss</p>
+                    <p className={`mt-1 text-lg font-semibold ${metricColor(filteredPnlBridge.worstLoss)}`}>
+                      {formatSignedUsd(filteredPnlBridge.worstLoss)}
                     </p>
                   </div>
                 </div>
-                <p className="mt-2 text-xs text-slate-500">
-                  Missing legs: {filteredMissingImpact.count} | Exposure {filteredMissingImpact.exposureShares.toFixed(2)} shares
+                <p className="mt-2 rounded-lg border border-slate-200/80 bg-white/80 px-2.5 py-2 text-xs text-slate-600">
+                  Net P/L = Gross wins + Gross losses
                 </p>
-                <p className="mt-1 text-xs text-slate-500">Notional at risk: {formatUsd(filteredMissingImpact.notional)}</p>
+                <p className="mt-2 text-xs text-slate-500">
+                  Missing legs {filteredMissingImpact.count} | Exposure {filteredMissingImpact.exposureShares.toFixed(2)} shares | Notional at risk{" "}
+                  {formatUsd(filteredMissingImpact.notional)}
+                </p>
+                <p className="mt-1 text-xs text-slate-500">
+                  Net P/L = Paired P/L + Missing-leg P/L
+                </p>
               </div>
             </div>
           </section>
@@ -756,88 +1008,33 @@ export default function TradesPage() {
             )}
           </section>
 
-          <section className="glass-panel rounded-2xl p-5 text-xs text-slate-500">
-            <p>
-              Wallet: <span className="font-medium text-slate-700">{summary.wallet}</span>
-            </p>
-            <p className="mt-1">As of: {new Date(summary.asOf).toLocaleString()}</p>
-            <p className="mt-1">
-              Debug counts {"->"} closed positions: {summary.records.closedPositions}, open positions:{" "}
-              {summary.records.openPositions}
-            </p>
-          </section>
-
           <section className="glass-panel overflow-hidden rounded-2xl">
             <div className="border-b border-slate-200/80 px-5 py-4">
-              <h3 className="text-lg font-semibold text-slate-900">Closed Pairs</h3>
+              <h3 className="text-lg font-semibold text-slate-900">Raw Trade Data</h3>
               <p className="mt-1 text-xs text-slate-500">
-                Sorted by market event time in title (most recent first). Uses Polymarket closed positions as source.
+                Closed pairs sorted by market event time (most recent first). This table is the source for filtered pair
+                metrics.
               </p>
-              <div className="mt-3 grid gap-2 sm:grid-cols-[auto,1fr] sm:items-center">
-                <label className="text-xs font-medium text-slate-600">Strategy filter</label>
-                <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
-                  <select
-                    value={strategyFilter}
-                    onChange={(event) =>
-                      setStrategyFilter(event.target.value as "all" | "btc_updown" | "eth_updown" | "custom")
-                    }
-                    className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-800"
-                  >
-                    <option value="all">All closed markets</option>
-                    <option value="btc_updown">Bitcoin Up or Down only</option>
-                    <option value="eth_updown">Ethereum Up or Down only</option>
-                    <option value="custom">Custom market text</option>
-                  </select>
-                  {strategyFilter === "custom" && (
-                    <input
-                      type="text"
-                      value={customStrategyFilter}
-                      onChange={(event) => setCustomStrategyFilter(event.target.value)}
-                      placeholder="e.g. Bitcoin Up or Down"
-                      className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-800"
-                    />
-                  )}
-                </div>
+            </div>
+            <div className="sticky top-[5.25rem] z-10 border-y border-slate-200/80 bg-white/90 px-4 py-2 backdrop-blur-sm sm:px-5">
+              <div className="flex flex-wrap items-center gap-2 text-xs">
+                <span className="font-semibold uppercase tracking-wide text-slate-500">Active filters</span>
+                <span className="rounded-full border border-slate-200 bg-white px-2.5 py-1 text-slate-700">
+                  Strategy: {strategyFilterLabel}
+                </span>
+                <span className="rounded-full border border-slate-200 bg-white px-2.5 py-1 text-slate-700">
+                  Date: {dateRangeLabel}
+                </span>
+                <span className="rounded-full border border-slate-200 bg-white px-2.5 py-1 text-slate-700">
+                  Net P/L: {formatSignedUsd(filteredPnlBridge.netPnl)}
+                </span>
+                <span className="rounded-full border border-slate-200 bg-white px-2.5 py-1 text-slate-700">
+                  Theoretical edge (1x): {formatSignedUsd(filteredPairExecution.grossEdgeUsd)}
+                </span>
+                <span className="rounded-full border border-amber-200 bg-amber-50 px-2.5 py-1 text-amber-800">
+                  Missing-leg P/L: {formatSignedUsd(filteredPnlBridge.missingLegPnl)}
+                </span>
               </div>
-              <div className="mt-3 grid gap-2 sm:grid-cols-[auto,1fr] sm:items-center">
-                <label className="text-xs font-medium text-slate-600">Date range</label>
-                <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
-                  <select
-                    value={dateRangePreset}
-                    onChange={(event) => setDateRangePreset(event.target.value as DateRangePreset)}
-                    className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-800"
-                  >
-                    <option value="all">All time</option>
-                    <option value="24h">Past 24 hours</option>
-                    <option value="7d">Past 7 days</option>
-                    <option value="30d">Past 30 days</option>
-                    <option value="month_to_date">Month to date</option>
-                    <option value="last_month">Last month</option>
-                    <option value="custom">Custom range</option>
-                  </select>
-                  {dateRangePreset === "custom" && (
-                    <>
-                      <input
-                        type="date"
-                        value={customStartDate}
-                        onChange={(event) => setCustomStartDate(event.target.value)}
-                        className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-800"
-                      />
-                      <span className="text-xs text-slate-500">to</span>
-                      <input
-                        type="date"
-                        value={customEndDate}
-                        onChange={(event) => setCustomEndDate(event.target.value)}
-                        className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-800"
-                      />
-                    </>
-                  )}
-                </div>
-              </div>
-              <p className="mt-2 text-xs text-slate-600">
-                Audit checks: Missing legs {closedAuditSummary.missingLegs} | Flagged rows{" "}
-                {closedAuditSummary.flagged}
-              </p>
             </div>
             <div className="overflow-x-auto px-3 sm:px-4">
               <table className="w-full border-collapse text-sm">
@@ -929,9 +1126,13 @@ export default function TradesPage() {
                 </tbody>
               </table>
             </div>
-            <div className="flex items-center justify-between border-t border-slate-200/80 px-6 py-3 text-sm">
+            <div className="flex flex-wrap items-center justify-between gap-2 border-t border-slate-200/80 px-6 py-3 text-sm">
               <p className="text-slate-600">
                 Showing {Math.min(closedRowsVisible, filteredClosedRows.length)} of {filteredClosedRows.length} pairs
+              </p>
+              <p className="text-xs text-slate-500">
+                Wallet {summary.wallet.slice(0, 8)}...{summary.wallet.slice(-4)} · As of{" "}
+                {new Date(summary.asOf).toLocaleString()}
               </p>
               <div className="flex gap-2">
                 {closedRowsVisible > 50 && (
