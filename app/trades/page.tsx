@@ -87,12 +87,77 @@ const formatSignedUsd = (value: number): string => `${value >= 0 ? "+" : "-"}${f
 const formatSignedCents = (value: number): string => `${value >= 0 ? "+" : "-"}${Math.abs(value).toFixed(2)}c`;
 const formatAvgPriceCents = (value: number | null): string => (value === null ? "-" : `${Math.round(value * 100)}c`);
 type DateRangePreset = "all" | "24h" | "7d" | "30d" | "month_to_date" | "last_month" | "custom";
+type AbDurationPreset = "1h" | "3h" | "6h" | "12h" | "24h" | "custom";
+const MARKET_TIME_ZONE = "America/New_York";
 
-const toDateInput = (date: Date): string => {
+const toDateTimeInput = (date: Date): string => {
   const y = date.getFullYear();
   const m = `${date.getMonth() + 1}`.padStart(2, "0");
   const d = `${date.getDate()}`.padStart(2, "0");
-  return `${y}-${m}-${d}`;
+  const hh = `${date.getHours()}`.padStart(2, "0");
+  const mm = `${date.getMinutes()}`.padStart(2, "0");
+  return `${y}-${m}-${d}T${hh}:${mm}`;
+};
+
+const parseDateTimeInputMs = (value: string): number | null => {
+  if (!value) {
+    return null;
+  }
+  const parsed = new Date(value).getTime();
+  return Number.isFinite(parsed) ? parsed : null;
+};
+
+const floorToHourMs = (valueMs: number): number => Math.floor(valueMs / (60 * 60 * 1000)) * (60 * 60 * 1000);
+
+const getDateTimeWindowBounds = (
+  startAt: string,
+  endAt: string
+): { startMs: number | null; endMs: number | null } => {
+  const startMs = parseDateTimeInputMs(startAt);
+  const endMs = parseDateTimeInputMs(endAt);
+  return {
+    startMs: startMs !== null ? startMs : null,
+    endMs: endMs !== null ? endMs : null
+  };
+};
+
+const getComparisonDurationMs = (preset: AbDurationPreset, customHours: string): number => {
+  if (preset === "custom") {
+    const hours = Number(customHours);
+    if (!Number.isFinite(hours) || hours <= 0) {
+      return 0;
+    }
+    return hours * 60 * 60 * 1000;
+  }
+  const presetHours: Record<Exclude<AbDurationPreset, "custom">, number> = {
+    "1h": 1,
+    "3h": 3,
+    "6h": 6,
+    "12h": 12,
+    "24h": 24
+  };
+  return presetHours[preset] * 60 * 60 * 1000;
+};
+
+const formatWindowLabel = (startMs: number | null, endMs: number | null): string => {
+  if (startMs === null || endMs === null) {
+    return "-";
+  }
+  const startText = new Date(startMs).toLocaleString(undefined, {
+    timeZone: MARKET_TIME_ZONE,
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit"
+  });
+  const endText = new Date(endMs).toLocaleString(undefined, {
+    timeZone: MARKET_TIME_ZONE,
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit"
+  });
+  return `${startText} to ${endText}`;
 };
 
 const getDateRangeBounds = (
@@ -147,18 +212,6 @@ const isInDateRange = (timestampMs: number, startMs: number | null, endMs: numbe
 
 const getRowTimeMs = (row: PolymarketSummaryResponse["closedPairRows"][number]): number =>
   Date.parse(row.eventTime ?? row.closedAt);
-
-const getWindowBounds = (startDate: string, endDate: string): { startMs: number | null; endMs: number | null } => {
-  if (!startDate || !endDate) {
-    return { startMs: null, endMs: null };
-  }
-  const startMs = new Date(`${startDate}T00:00:00`).getTime();
-  const endMs = new Date(`${endDate}T00:00:00`).getTime() + 24 * 60 * 60 * 1000;
-  return {
-    startMs: Number.isFinite(startMs) ? startMs : null,
-    endMs: Number.isFinite(endMs) ? endMs : null
-  };
-};
 
 const matchesStrategy = (marketTitle: string, strategy: string, customFilter: string): boolean => {
   const title = marketTitle.toLowerCase();
@@ -390,10 +443,18 @@ export default function TradesPage() {
   const [customStartDate, setCustomStartDate] = useState("");
   const [customEndDate, setCustomEndDate] = useState("");
   const [tablePairFilter, setTablePairFilter] = useState<"all" | "missing" | "paired">("all");
-  const [windowAStart, setWindowAStart] = useState("");
-  const [windowAEnd, setWindowAEnd] = useState("");
-  const [windowBStart, setWindowBStart] = useState("");
-  const [windowBEnd, setWindowBEnd] = useState("");
+  const [comparisonMode, setComparisonMode] = useState<"quick" | "manual">("quick");
+  const [comparisonDurationPreset, setComparisonDurationPreset] = useState<AbDurationPreset>("24h");
+  const [comparisonCustomHours, setComparisonCustomHours] = useState("6");
+  const [quickAnchorEndMs, setQuickAnchorEndMs] = useState<number | null>(null);
+  const [windowAStartAt, setWindowAStartAt] = useState("");
+  const [windowAEndAt, setWindowAEndAt] = useState("");
+  const [windowBStartAt, setWindowBStartAt] = useState("");
+  const [windowBEndAt, setWindowBEndAt] = useState("");
+  const [manualAppliedWindowAStartAt, setManualAppliedWindowAStartAt] = useState("");
+  const [manualAppliedWindowAEndAt, setManualAppliedWindowAEndAt] = useState("");
+  const [manualAppliedWindowBStartAt, setManualAppliedWindowBStartAt] = useState("");
+  const [manualAppliedWindowBEndAt, setManualAppliedWindowBEndAt] = useState("");
   const [isAllTimeSummaryOpen, setIsAllTimeSummaryOpen] = useState(true);
   const [isIterationComparisonOpen, setIsIterationComparisonOpen] = useState(false);
 
@@ -444,21 +505,58 @@ export default function TradesPage() {
     [filteredClosedRows]
   );
 
+  const comparisonDurationMs = useMemo(
+    () => getComparisonDurationMs(comparisonDurationPreset, comparisonCustomHours),
+    [comparisonDurationPreset, comparisonCustomHours]
+  );
+
+  const quickComparisonBounds = useMemo(() => {
+    if (quickAnchorEndMs === null || comparisonDurationMs <= 0) {
+      return { aStartMs: null, aEndMs: null, bStartMs: null, bEndMs: null };
+    }
+    return {
+      aStartMs: quickAnchorEndMs - 2 * comparisonDurationMs,
+      aEndMs: quickAnchorEndMs - comparisonDurationMs,
+      bStartMs: quickAnchorEndMs - comparisonDurationMs,
+      bEndMs: quickAnchorEndMs
+    };
+  }, [quickAnchorEndMs, comparisonDurationMs]);
+
+  const manualWindowABounds = useMemo(
+    () => getDateTimeWindowBounds(manualAppliedWindowAStartAt, manualAppliedWindowAEndAt),
+    [manualAppliedWindowAStartAt, manualAppliedWindowAEndAt]
+  );
+  const manualWindowBBounds = useMemo(
+    () => getDateTimeWindowBounds(manualAppliedWindowBStartAt, manualAppliedWindowBEndAt),
+    [manualAppliedWindowBStartAt, manualAppliedWindowBEndAt]
+  );
+
+  const activeWindowABounds =
+    comparisonMode === "manual"
+      ? manualWindowABounds
+      : { startMs: quickComparisonBounds.aStartMs, endMs: quickComparisonBounds.aEndMs };
+  const activeWindowBBounds =
+    comparisonMode === "manual"
+      ? manualWindowBBounds
+      : { startMs: quickComparisonBounds.bStartMs, endMs: quickComparisonBounds.bEndMs };
+
   const windowARows = useMemo(() => {
-    const { startMs, endMs } = getWindowBounds(windowAStart, windowAEnd);
-    if (startMs === null || endMs === null) {
+    if (activeWindowABounds.startMs === null || activeWindowABounds.endMs === null) {
       return [];
     }
-    return strategyClosedRows.filter((row) => isInDateRange(getRowTimeMs(row), startMs, endMs));
-  }, [strategyClosedRows, windowAStart, windowAEnd]);
+    return strategyClosedRows.filter((row) =>
+      isInDateRange(getRowTimeMs(row), activeWindowABounds.startMs, activeWindowABounds.endMs)
+    );
+  }, [strategyClosedRows, activeWindowABounds.startMs, activeWindowABounds.endMs]);
 
   const windowBRows = useMemo(() => {
-    const { startMs, endMs } = getWindowBounds(windowBStart, windowBEnd);
-    if (startMs === null || endMs === null) {
+    if (activeWindowBBounds.startMs === null || activeWindowBBounds.endMs === null) {
       return [];
     }
-    return strategyClosedRows.filter((row) => isInDateRange(getRowTimeMs(row), startMs, endMs));
-  }, [strategyClosedRows, windowBStart, windowBEnd]);
+    return strategyClosedRows.filter((row) =>
+      isInDateRange(getRowTimeMs(row), activeWindowBBounds.startMs, activeWindowBBounds.endMs)
+    );
+  }, [strategyClosedRows, activeWindowBBounds.startMs, activeWindowBBounds.endMs]);
 
   const windowAMetrics = useMemo(() => computeWindowMetrics(windowARows), [windowARows]);
   const windowBMetrics = useMemo(() => computeWindowMetrics(windowBRows), [windowBRows]);
@@ -473,6 +571,31 @@ export default function TradesPage() {
       edgeP50: windowBMetrics.edgeP50 - windowAMetrics.edgeP50
     }),
     [windowAMetrics, windowBMetrics]
+  );
+  const activeWindowALabel = useMemo(
+    () => formatWindowLabel(activeWindowABounds.startMs, activeWindowABounds.endMs),
+    [activeWindowABounds.startMs, activeWindowABounds.endMs]
+  );
+  const activeWindowBLabel = useMemo(
+    () => formatWindowLabel(activeWindowBBounds.startMs, activeWindowBBounds.endMs),
+    [activeWindowBBounds.startMs, activeWindowBBounds.endMs]
+  );
+  const hasManualWindowChanges = useMemo(
+    () =>
+      windowAStartAt !== manualAppliedWindowAStartAt ||
+      windowAEndAt !== manualAppliedWindowAEndAt ||
+      windowBStartAt !== manualAppliedWindowBStartAt ||
+      windowBEndAt !== manualAppliedWindowBEndAt,
+    [
+      windowAStartAt,
+      manualAppliedWindowAStartAt,
+      windowAEndAt,
+      manualAppliedWindowAEndAt,
+      windowBStartAt,
+      manualAppliedWindowBStartAt,
+      windowBEndAt,
+      manualAppliedWindowBEndAt
+    ]
   );
 
   const strategyFilterLabel = useMemo(
@@ -492,21 +615,31 @@ export default function TradesPage() {
     if (!summary) {
       return;
     }
-    const now = new Date();
-    const bEnd = new Date(now);
-    const bStart = new Date(now);
-    bStart.setDate(bStart.getDate() - 6);
+    const roundedNowMs = floorToHourMs(Date.now());
+    const durationMs = 24 * 60 * 60 * 1000;
+    const bStartMs = roundedNowMs - durationMs;
+    const aStartMs = bStartMs - durationMs;
 
-    const aEnd = new Date(bStart);
-    aEnd.setDate(aEnd.getDate() - 1);
-    const aStart = new Date(aEnd);
-    aStart.setDate(aStart.getDate() - 6);
-
-    setWindowAStart(toDateInput(aStart));
-    setWindowAEnd(toDateInput(aEnd));
-    setWindowBStart(toDateInput(bStart));
-    setWindowBEnd(toDateInput(bEnd));
+    setComparisonMode("quick");
+    setComparisonDurationPreset("24h");
+    setComparisonCustomHours("6");
+    setQuickAnchorEndMs(roundedNowMs);
+    setWindowAStartAt(toDateTimeInput(new Date(aStartMs)));
+    setWindowAEndAt(toDateTimeInput(new Date(bStartMs)));
+    setWindowBStartAt(toDateTimeInput(new Date(bStartMs)));
+    setWindowBEndAt(toDateTimeInput(new Date(roundedNowMs)));
+    setManualAppliedWindowAStartAt(toDateTimeInput(new Date(aStartMs)));
+    setManualAppliedWindowAEndAt(toDateTimeInput(new Date(bStartMs)));
+    setManualAppliedWindowBStartAt(toDateTimeInput(new Date(bStartMs)));
+    setManualAppliedWindowBEndAt(toDateTimeInput(new Date(roundedNowMs)));
   }, [summary, summary?.asOf, strategyFilter, customStrategyFilter]);
+
+  useEffect(() => {
+    if (comparisonMode !== "quick") {
+      return;
+    }
+    setQuickAnchorEndMs(floorToHourMs(Date.now()));
+  }, [comparisonMode, comparisonDurationPreset, comparisonCustomHours]);
 
   const onFetchSummary = async () => {
     const wallet = walletInput.trim();
@@ -645,7 +778,7 @@ export default function TradesPage() {
                     onChange={(event) =>
                       setStrategyFilter(event.target.value as "all" | "btc_updown" | "eth_updown" | "custom")
                     }
-                    className="w-full rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-800 sm:w-[18rem]"
+                    className="h-11 w-full rounded-lg border border-slate-300 bg-white px-3 text-sm text-slate-800 sm:w-[18rem]"
                   >
                     <option value="all">All closed markets</option>
                     <option value="btc_updown">Bitcoin Up or Down only</option>
@@ -658,7 +791,7 @@ export default function TradesPage() {
                       value={customStrategyFilter}
                       onChange={(event) => setCustomStrategyFilter(event.target.value)}
                       placeholder="e.g. Bitcoin Up or Down"
-                      className="w-full rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-800 sm:w-[18rem]"
+                      className="h-11 w-full rounded-lg border border-slate-300 bg-white px-3 text-sm text-slate-800 sm:w-[18rem]"
                     />
                   )}
                 </div>
@@ -670,7 +803,7 @@ export default function TradesPage() {
                   <select
                     value={dateRangePreset}
                     onChange={(event) => setDateRangePreset(event.target.value as DateRangePreset)}
-                    className="w-full rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-800 sm:w-[13rem]"
+                    className="h-11 w-full rounded-lg border border-slate-300 bg-white px-3 text-sm text-slate-800 sm:w-[13rem]"
                   >
                     <option value="all">All time</option>
                     <option value="24h">Past 24 hours</option>
@@ -686,14 +819,14 @@ export default function TradesPage() {
                         type="date"
                         value={customStartDate}
                         onChange={(event) => setCustomStartDate(event.target.value)}
-                        className="w-full rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-800"
+                        className="h-11 w-full rounded-lg border border-slate-300 bg-white px-3 text-sm text-slate-800"
                       />
                       <span className="text-xs text-slate-500">to</span>
                       <input
                         type="date"
                         value={customEndDate}
                         onChange={(event) => setCustomEndDate(event.target.value)}
-                        className="w-full rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-800"
+                        className="h-11 w-full rounded-lg border border-slate-300 bg-white px-3 text-sm text-slate-800"
                       />
                     </>
                   )}
@@ -856,7 +989,7 @@ export default function TradesPage() {
                 <h3 className="text-sm font-semibold uppercase tracking-wide text-slate-600">
                   Iteration Comparison (A vs B)
                 </h3>
-                <p className="mt-1 text-xs text-slate-500">Uses strategy filter, independent date windows</p>
+                <p className="mt-1 text-xs text-slate-500">Quick chunk mode with optional advanced manual windows</p>
               </div>
               <span className="text-xs font-medium text-slate-600">
                 {isIterationComparisonOpen ? "Collapse" : "Expand"}
@@ -865,44 +998,162 @@ export default function TradesPage() {
 
             {isIterationComparisonOpen && (
               <div className="border-t border-slate-200/80 px-5 py-4">
-                <div className="grid gap-3 lg:grid-cols-2">
-                  <div className="rounded-xl border border-slate-200/90 bg-white/70 p-4">
-                    <p className="text-xs font-medium uppercase tracking-wide text-slate-500">Window A (Baseline)</p>
-                    <div className="mt-2 flex flex-wrap items-center gap-2">
-                      <input
-                        type="date"
-                        value={windowAStart}
-                        onChange={(event) => setWindowAStart(event.target.value)}
-                        className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-800"
-                      />
-                      <span className="text-xs text-slate-500">to</span>
-                      <input
-                        type="date"
-                        value={windowAEnd}
-                        onChange={(event) => setWindowAEnd(event.target.value)}
-                        className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-800"
-                      />
+                <div className="rounded-xl border border-slate-200/90 bg-white/70 p-4">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div>
+                      <p className="text-xs font-medium uppercase tracking-wide text-slate-500">Compare Mode</p>
+                      <div className="mt-2 inline-flex rounded-lg border border-slate-200 bg-white p-1">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setComparisonMode("quick");
+                            setQuickAnchorEndMs(floorToHourMs(Date.now()));
+                          }}
+                          className={`rounded-md px-3 py-1.5 text-xs font-medium transition ${
+                            comparisonMode === "quick"
+                              ? "bg-emerald-100 text-emerald-800"
+                              : "text-slate-600 hover:bg-slate-100"
+                          }`}
+                        >
+                          Quick
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setComparisonMode("manual")}
+                          className={`rounded-md px-3 py-1.5 text-xs font-medium transition ${
+                            comparisonMode === "manual"
+                              ? "bg-emerald-100 text-emerald-800"
+                              : "text-slate-600 hover:bg-slate-100"
+                          }`}
+                        >
+                          Advanced
+                        </button>
+                      </div>
                     </div>
+                    <span className="text-xs text-slate-500">Time zone: ET ({MARKET_TIME_ZONE})</span>
                   </div>
+                  {comparisonMode === "quick" ? (
+                    <div
+                      className={`mt-3 grid gap-2 sm:gap-3 lg:items-start ${
+                        comparisonDurationPreset === "custom"
+                          ? "lg:grid-cols-[11rem_9rem_max-content]"
+                          : "lg:grid-cols-[11rem_max-content]"
+                      }`}
+                    >
+                      <div className="flex flex-col">
+                        <label className="text-[11px] uppercase tracking-wide text-slate-500">Chunk size</label>
+                        <select
+                          value={comparisonDurationPreset}
+                          onChange={(event) => setComparisonDurationPreset(event.target.value as AbDurationPreset)}
+                          className="mt-1 h-11 w-full rounded-lg border border-slate-300 bg-white px-3 text-sm text-slate-800"
+                        >
+                          <option value="1h">1 hour</option>
+                          <option value="3h">3 hours</option>
+                          <option value="6h">6 hours</option>
+                          <option value="12h">12 hours</option>
+                          <option value="24h">24 hours</option>
+                          <option value="custom">Custom</option>
+                        </select>
+                      </div>
 
-                  <div className="rounded-xl border border-slate-200/90 bg-white/70 p-4">
-                    <p className="text-xs font-medium uppercase tracking-wide text-slate-500">Window B (Candidate)</p>
-                    <div className="mt-2 flex flex-wrap items-center gap-2">
-                      <input
-                        type="date"
-                        value={windowBStart}
-                        onChange={(event) => setWindowBStart(event.target.value)}
-                        className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-800"
-                      />
-                      <span className="text-xs text-slate-500">to</span>
-                      <input
-                        type="date"
-                        value={windowBEnd}
-                        onChange={(event) => setWindowBEnd(event.target.value)}
-                        className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-800"
-                      />
+                      {comparisonDurationPreset === "custom" && (
+                        <div className="flex flex-col">
+                          <label className="text-[11px] uppercase tracking-wide text-slate-500">Custom hours</label>
+                          <input
+                            type="number"
+                            min="0.25"
+                            step="0.25"
+                            value={comparisonCustomHours}
+                            onChange={(event) => setComparisonCustomHours(event.target.value)}
+                            className="mt-1 h-11 w-full rounded-lg border border-slate-300 bg-white px-3 text-sm text-slate-800"
+                          />
+                        </div>
+                      )}
+
+                      <div className="flex flex-col">
+                        <span className="text-[11px] uppercase tracking-wide text-transparent select-none">Action</span>
+                        <button
+                          type="button"
+                          onClick={() => setQuickAnchorEndMs(floorToHourMs(Date.now()))}
+                          className="mt-1 h-11 w-fit whitespace-nowrap rounded-lg border border-slate-300 bg-white px-4 text-xs font-medium text-slate-700 transition hover:bg-slate-50"
+                        >
+                          Refresh to now
+                        </button>
+                      </div>
                     </div>
-                  </div>
+                  ) : (
+                    <div className="mt-3">
+                      <div className="grid gap-3 lg:grid-cols-2">
+                        <div className="rounded-xl border border-slate-200/90 bg-white/80 p-4">
+                          <p className="text-xs font-medium uppercase tracking-wide text-slate-500">Window A (Baseline)</p>
+                          <div className="mt-2 flex flex-wrap items-center gap-2">
+                            <input
+                              type="datetime-local"
+                              value={windowAStartAt}
+                              onChange={(event) => setWindowAStartAt(event.target.value)}
+                              className="h-11 rounded-lg border border-slate-300 bg-white px-3 text-sm text-slate-800"
+                            />
+                            <span className="text-xs text-slate-500">to</span>
+                            <input
+                              type="datetime-local"
+                              value={windowAEndAt}
+                              onChange={(event) => setWindowAEndAt(event.target.value)}
+                              className="h-11 rounded-lg border border-slate-300 bg-white px-3 text-sm text-slate-800"
+                            />
+                          </div>
+                        </div>
+
+                        <div className="rounded-xl border border-slate-200/90 bg-white/80 p-4">
+                          <p className="text-xs font-medium uppercase tracking-wide text-slate-500">Window B (Candidate)</p>
+                          <div className="mt-2 flex flex-wrap items-center gap-2">
+                            <input
+                              type="datetime-local"
+                              value={windowBStartAt}
+                              onChange={(event) => setWindowBStartAt(event.target.value)}
+                              className="h-11 rounded-lg border border-slate-300 bg-white px-3 text-sm text-slate-800"
+                            />
+                            <span className="text-xs text-slate-500">to</span>
+                            <input
+                              type="datetime-local"
+                              value={windowBEndAt}
+                              onChange={(event) => setWindowBEndAt(event.target.value)}
+                              className="h-11 rounded-lg border border-slate-300 bg-white px-3 text-sm text-slate-800"
+                            />
+                          </div>
+                        </div>
+                      </div>
+                      <div className="mt-3 flex justify-end">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setManualAppliedWindowAStartAt(windowAStartAt);
+                            setManualAppliedWindowAEndAt(windowAEndAt);
+                            setManualAppliedWindowBStartAt(windowBStartAt);
+                            setManualAppliedWindowBEndAt(windowBEndAt);
+                            setComparisonMode("manual");
+                          }}
+                          disabled={!hasManualWindowChanges}
+                          className={`h-11 rounded-lg border px-4 text-xs font-medium transition ${
+                            hasManualWindowChanges
+                              ? "border-emerald-300 bg-emerald-100 text-emerald-800 hover:bg-emerald-50"
+                              : "cursor-not-allowed border-slate-300 bg-white text-slate-500"
+                          }`}
+                        >
+                          Apply windows
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
+                  {comparisonMode === "quick" && (
+                    <p className="mt-2 text-xs text-slate-500">
+                      Quick logic: B = last chunk ending now. A = immediately previous chunk.
+                    </p>
+                  )}
+                  <p className="mt-3 text-xs text-slate-600">
+                    Active mode: <span className="font-medium text-slate-700">{comparisonMode === "quick" ? "Quick" : "Manual"}</span> |
+                    A {activeWindowALabel} | B {activeWindowBLabel}
+                  </p>
                 </div>
 
                 <div className="mt-4 overflow-x-auto rounded-xl border border-slate-200/90 bg-white/80">
@@ -1091,7 +1342,7 @@ export default function TradesPage() {
                 </span>
               </div>
             </div>
-            <div className="overflow-x-auto px-3 sm:px-4">
+            <div className="overflow-x-auto">
               <table className="w-full border-collapse text-sm">
                 <thead className="bg-slate-100/95">
                   <tr>
@@ -1136,7 +1387,7 @@ export default function TradesPage() {
                             href={row.marketUrl}
                             target="_blank"
                             rel="noopener noreferrer"
-                            className="whitespace-nowrap text-[0.9rem] leading-snug text-slate-800 hover:text-emerald-700 hover:underline underline-offset-2"
+                            className="whitespace-nowrap text-[0.9rem] leading-snug text-emerald-700 underline decoration-emerald-400/70 underline-offset-2 hover:text-emerald-800"
                             title={`Open on Polymarket: ${row.marketTitle}`}
                           >
                             {row.marketTitle}
