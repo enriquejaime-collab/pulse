@@ -75,6 +75,25 @@ interface PolymarketSummaryResponse {
   };
 }
 
+interface PersistedWalletProfile {
+  id: string;
+  propertyId: string;
+  wallet: string;
+  label: string | null;
+  strategyTag: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+interface PersistedProperty {
+  id: string;
+  name: string;
+  description: string | null;
+  createdAt: string;
+  updatedAt: string;
+  wallets: PersistedWalletProfile[];
+}
+
 const formatUsd = (value: number): string =>
   new Intl.NumberFormat("en-US", {
     style: "currency",
@@ -440,6 +459,15 @@ const metricColor = (value: number): string => {
 export default function TradesPage() {
   const [walletInput, setWalletInput] = useState("");
   const [summary, setSummary] = useState<PolymarketSummaryResponse | null>(null);
+  const [properties, setProperties] = useState<PersistedProperty[]>([]);
+  const [persistenceBackend, setPersistenceBackend] = useState<"supabase" | "local" | "unknown">("unknown");
+  const [selectedPropertyId, setSelectedPropertyId] = useState("");
+  const [selectedWalletId, setSelectedWalletId] = useState("");
+  const [newPropertyName, setNewPropertyName] = useState("");
+  const [walletLabelInput, setWalletLabelInput] = useState("");
+  const [isPropertiesLoading, setIsPropertiesLoading] = useState(false);
+  const [isPropertyActionLoading, setIsPropertyActionLoading] = useState(false);
+  const [lastSyncSource, setLastSyncSource] = useState<"live" | "cache" | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [closedRowsVisible, setClosedRowsVisible] = useState(50);
@@ -463,6 +491,15 @@ export default function TradesPage() {
   const [manualAppliedWindowBEndAt, setManualAppliedWindowBEndAt] = useState("");
   const [isAllTimeSummaryOpen, setIsAllTimeSummaryOpen] = useState(true);
   const [isIterationComparisonOpen, setIsIterationComparisonOpen] = useState(false);
+
+  const selectedProperty = useMemo(
+    () => properties.find((property) => property.id === selectedPropertyId) ?? null,
+    [properties, selectedPropertyId]
+  );
+  const selectedWalletProfile = useMemo(
+    () => selectedProperty?.wallets.find((wallet) => wallet.id === selectedWalletId) ?? null,
+    [selectedProperty, selectedWalletId]
+  );
 
   const strategyClosedRows = useMemo(() => {
     if (!summary) {
@@ -613,6 +650,63 @@ export default function TradesPage() {
     [dateRangePreset, customStartDate, customEndDate]
   );
 
+  const loadProperties = async (
+    preferredPropertyId?: string,
+    preferredWalletId?: string
+  ): Promise<PersistedProperty[] | null> => {
+    setIsPropertiesLoading(true);
+    try {
+      const response = await fetch("/api/properties");
+      const payload = (await response.json()) as {
+        properties?: PersistedProperty[];
+        backend?: "supabase" | "local";
+        error?: string;
+      };
+      if (!response.ok) {
+        throw new Error(payload.error ?? "Failed to load properties.");
+      }
+
+      const nextProperties = payload.properties ?? [];
+      setProperties(nextProperties);
+      setPersistenceBackend(payload.backend ?? "unknown");
+
+      const resolvedPropertyId =
+        preferredPropertyId && nextProperties.some((property) => property.id === preferredPropertyId)
+          ? preferredPropertyId
+          : selectedPropertyId && nextProperties.some((property) => property.id === selectedPropertyId)
+            ? selectedPropertyId
+            : nextProperties[0]?.id ?? "";
+      setSelectedPropertyId(resolvedPropertyId);
+
+      const walletsForProperty = nextProperties.find((property) => property.id === resolvedPropertyId)?.wallets ?? [];
+      const resolvedWalletId =
+        preferredWalletId && walletsForProperty.some((wallet) => wallet.id === preferredWalletId)
+          ? preferredWalletId
+          : selectedWalletId && walletsForProperty.some((wallet) => wallet.id === selectedWalletId)
+            ? selectedWalletId
+            : walletsForProperty[0]?.id ?? "";
+      setSelectedWalletId(resolvedWalletId);
+
+      const selectedWallet = walletsForProperty.find((wallet) => wallet.id === resolvedWalletId);
+      if (selectedWallet) {
+        setWalletInput(selectedWallet.wallet);
+        setWalletLabelInput(selectedWallet.label ?? "");
+      }
+      return nextProperties;
+    } catch (loadError) {
+      const message = loadError instanceof Error ? loadError.message : "Failed to load properties.";
+      setError(message);
+      return null;
+    } finally {
+      setIsPropertiesLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    void loadProperties();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   useEffect(() => {
     setClosedRowsVisible(50);
   }, [summary?.asOf, strategyFilter, customStrategyFilter, dateRangePreset, customStartDate, customEndDate, tablePairFilter]);
@@ -647,8 +741,108 @@ export default function TradesPage() {
     setQuickAnchorEndMs(floorToHourMs(Date.now()));
   }, [comparisonMode, comparisonDurationPreset, comparisonCustomHours]);
 
+  const onCreateProperty = async () => {
+    const name = newPropertyName.trim();
+    if (!name) {
+      setError("Enter a property name first.");
+      return;
+    }
+    setIsPropertyActionLoading(true);
+    setError(null);
+    try {
+      const response = await fetch("/api/properties", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name })
+      });
+      const payload = (await response.json()) as { property?: PersistedProperty; error?: string };
+      if (!response.ok || !payload.property) {
+        throw new Error(payload.error ?? "Failed to create property.");
+      }
+      setNewPropertyName("");
+      await loadProperties(payload.property.id);
+    } catch (createError) {
+      const message = createError instanceof Error ? createError.message : "Failed to create property.";
+      setError(message);
+    } finally {
+      setIsPropertyActionLoading(false);
+    }
+  };
+
+  const onSaveWalletToProperty = async () => {
+    const wallet = walletInput.trim().toLowerCase();
+    if (!selectedPropertyId) {
+      setError("Create or select a property first.");
+      return;
+    }
+    if (!wallet) {
+      setError("Enter a wallet address first.");
+      return;
+    }
+    setIsPropertyActionLoading(true);
+    setError(null);
+    try {
+      const response = await fetch(`/api/properties/${encodeURIComponent(selectedPropertyId)}/wallets`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          wallet,
+          label: walletLabelInput.trim() || null
+        })
+      });
+      const payload = (await response.json()) as { wallet?: PersistedWalletProfile; error?: string };
+      if (!response.ok || !payload.wallet) {
+        throw new Error(payload.error ?? "Failed to save wallet.");
+      }
+      await loadProperties(selectedPropertyId, payload.wallet.id);
+    } catch (saveError) {
+      const message = saveError instanceof Error ? saveError.message : "Failed to save wallet.";
+      setError(message);
+    } finally {
+      setIsPropertyActionLoading(false);
+    }
+  };
+
+  const onLoadCachedSummary = async () => {
+    const wallet = selectedWalletProfile?.wallet ?? walletInput.trim().toLowerCase();
+    if (!selectedPropertyId) {
+      setError("Select a property first.");
+      return;
+    }
+    if (!wallet) {
+      setError("Select a wallet profile first.");
+      return;
+    }
+    setIsLoading(true);
+    setError(null);
+    try {
+      const response = await fetch(
+        `/api/properties/${encodeURIComponent(selectedPropertyId)}/summary?wallet=${encodeURIComponent(wallet)}`
+      );
+      const payload = (await response.json()) as {
+        snapshot?: { summary: PolymarketSummaryResponse } | null;
+        error?: string;
+      };
+      if (!response.ok) {
+        throw new Error(payload.error ?? "Failed to load cached snapshot.");
+      }
+      if (!payload.snapshot?.summary) {
+        throw new Error("No cached snapshot found for this wallet yet.");
+      }
+      setSummary(payload.snapshot.summary);
+      setLastSyncSource("cache");
+      setWalletInput(wallet);
+    } catch (cachedError) {
+      const message = cachedError instanceof Error ? cachedError.message : "Failed to load cached summary.";
+      setError(message);
+      setSummary(null);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
   const onFetchSummary = async () => {
-    const wallet = walletInput.trim();
+    const wallet = walletInput.trim().toLowerCase();
     if (!wallet) {
       setError("Enter your wallet address first.");
       setSummary(null);
@@ -659,23 +853,42 @@ export default function TradesPage() {
     setError(null);
 
     try {
-      const response = await fetch(`/api/polymarket/summary?wallet=${encodeURIComponent(wallet)}`);
-      const payload = (await response.json()) as unknown;
+      if (selectedPropertyId) {
+        const response = await fetch(`/api/properties/${encodeURIComponent(selectedPropertyId)}/sync`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ wallet, forceRefresh: true })
+        });
+        const payload = (await response.json()) as {
+          source?: "live" | "cache";
+          summary?: PolymarketSummaryResponse;
+          error?: string;
+        };
+        if (!response.ok || !payload.summary) {
+          throw new Error(payload.error ?? "Failed to sync wallet.");
+        }
+        setSummary(payload.summary);
+        setLastSyncSource(payload.source ?? "live");
+        await loadProperties(selectedPropertyId);
+      } else {
+        const response = await fetch(`/api/polymarket/summary?wallet=${encodeURIComponent(wallet)}`);
+        const payload = (await response.json()) as unknown;
 
-      if (!response.ok) {
-        setSummary(null);
-        const errorMessage =
-          payload && typeof payload === "object" && "error" in payload && typeof payload.error === "string"
-            ? payload.error
-            : "Failed to fetch Polymarket data.";
-        setError(errorMessage);
-        return;
+        if (!response.ok) {
+          const errorMessage =
+            payload && typeof payload === "object" && "error" in payload && typeof payload.error === "string"
+              ? payload.error
+              : "Failed to fetch Polymarket data.";
+          throw new Error(errorMessage);
+        }
+
+        setSummary(payload as PolymarketSummaryResponse);
+        setLastSyncSource("live");
       }
-
-      setSummary(payload as PolymarketSummaryResponse);
-    } catch {
+    } catch (fetchError) {
       setSummary(null);
-      setError("Network error while loading your summary.");
+      const message = fetchError instanceof Error ? fetchError.message : "Network error while loading your summary.";
+      setError(message);
     } finally {
       setIsLoading(false);
     }
@@ -693,21 +906,129 @@ export default function TradesPage() {
           Uses your public wallet address to pull your Polymarket trading stats directly from API data.
         </p>
 
-        <div className="mt-5 flex flex-col gap-3 sm:flex-row">
+        <div className="mt-5 rounded-2xl border border-slate-200/90 bg-white/70 p-4">
+          <div className="grid gap-3 lg:grid-cols-2">
+            <div>
+              <label className="text-xs font-medium uppercase tracking-wide text-slate-500">Property</label>
+              <select
+                value={selectedPropertyId}
+                onChange={(event) => {
+                  const propertyId = event.target.value;
+                  setSelectedPropertyId(propertyId);
+                  const nextWallet = properties.find((property) => property.id === propertyId)?.wallets[0] ?? null;
+                  setSelectedWalletId(nextWallet?.id ?? "");
+                  if (nextWallet) {
+                    setWalletInput(nextWallet.wallet);
+                    setWalletLabelInput(nextWallet.label ?? "");
+                  }
+                }}
+                className="mt-1.5 h-11 w-full rounded-lg border border-slate-300 bg-white px-3 text-sm text-slate-800"
+              >
+                <option value="">No property selected</option>
+                {properties.map((property) => (
+                  <option key={property.id} value={property.id}>
+                    {property.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label className="text-xs font-medium uppercase tracking-wide text-slate-500">Stored Wallet</label>
+              <select
+                value={selectedWalletId}
+                onChange={(event) => {
+                  const walletId = event.target.value;
+                  setSelectedWalletId(walletId);
+                  const wallet = selectedProperty?.wallets.find((row) => row.id === walletId);
+                  if (wallet) {
+                    setWalletInput(wallet.wallet);
+                    setWalletLabelInput(wallet.label ?? "");
+                  }
+                }}
+                className="mt-1.5 h-11 w-full rounded-lg border border-slate-300 bg-white px-3 text-sm text-slate-800"
+                disabled={!selectedProperty}
+              >
+                <option value="">{selectedProperty ? "Select wallet profile" : "Select a property first"}</option>
+                {selectedProperty?.wallets.map((wallet) => (
+                  <option key={wallet.id} value={wallet.id}>
+                    {wallet.label ? `${wallet.label} · ${wallet.wallet.slice(0, 10)}...` : wallet.wallet}
+                  </option>
+                ))}
+              </select>
+            </div>
+          </div>
+
+          <div className="mt-3 grid gap-3 lg:grid-cols-3">
+            <input
+              type="text"
+              placeholder="New property name"
+              value={newPropertyName}
+              onChange={(event) => setNewPropertyName(event.target.value)}
+              className="h-11 w-full rounded-lg border border-slate-300 bg-white px-3 text-sm text-slate-800"
+            />
+            <input
+              type="text"
+              placeholder="Wallet label (optional)"
+              value={walletLabelInput}
+              onChange={(event) => setWalletLabelInput(event.target.value)}
+              className="h-11 w-full rounded-lg border border-slate-300 bg-white px-3 text-sm text-slate-800"
+            />
+            <div className="flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={onCreateProperty}
+                disabled={isPropertyActionLoading}
+                className="inline-flex h-11 items-center justify-center rounded-lg border border-slate-300 bg-white px-4 text-sm font-medium text-slate-800 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                Create Property
+              </button>
+              <button
+                type="button"
+                onClick={onSaveWalletToProperty}
+                disabled={isPropertyActionLoading || !selectedPropertyId}
+                className="inline-flex h-11 items-center justify-center rounded-lg border border-slate-300 bg-white px-4 text-sm font-medium text-slate-800 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                Save Wallet
+              </button>
+              <button
+                type="button"
+                onClick={onLoadCachedSummary}
+                disabled={isLoading || !selectedPropertyId}
+                className="inline-flex h-11 items-center justify-center rounded-lg border border-slate-300 bg-white px-4 text-sm font-medium text-slate-800 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                Load Cached
+              </button>
+            </div>
+          </div>
+
+          <p className="mt-3 text-xs text-slate-500">
+            Persistence backend: <span className="font-medium text-slate-700">{persistenceBackend}</span>
+            {isPropertiesLoading ? " · loading properties..." : ""}
+            {lastSyncSource ? (
+              <>
+                {" "}
+                · Last summary source:{" "}
+                <span className="font-medium text-slate-700">{lastSyncSource === "live" ? "live sync" : "cache"}</span>
+              </>
+            ) : null}
+          </p>
+        </div>
+
+        <div className="mt-4 flex flex-col gap-3 sm:flex-row">
           <input
             type="text"
             placeholder="0x..."
             value={walletInput}
             onChange={(event) => setWalletInput(event.target.value)}
-            className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-800"
+            className="h-11 w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-800"
           />
           <button
             type="button"
             onClick={onFetchSummary}
             disabled={isLoading}
-            className="inline-flex items-center justify-center rounded-xl border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-800 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
+            className="inline-flex h-11 items-center justify-center rounded-xl border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-800 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
           >
-            {isLoading ? "Loading..." : "Fetch"}
+            {isLoading ? "Syncing..." : selectedPropertyId ? "Sync + Fetch" : "Fetch"}
           </button>
         </div>
 
