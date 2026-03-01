@@ -1,0 +1,32 @@
+{
+  "name": "trade-tracker-ledger",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint",
+    "lint:types": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@types/papaparse": "^5.5.2",
+    "next": "^15.5.12",
+    "papaparse": "^5.5.3",
+    "react": "19.0.0",
+    "react-dom": "19.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.1",
+    "@types/react": "^19.0.1",
+    "@types/react-dom": "^19.0.1",
+    "@typescript-eslint/eslint-plugin": "^8.56.1",
+    "@typescript-eslint/parser": "^8.56.1",
+    "autoprefixer": "^10.4.20",
+    "eslint": "^9.39.3",
+    "eslint-config-next": "^15.5.12",
+    "postcss": "^8.4.49",
+    "tailwindcss": "^3.4.16",
+    "typescript": "^5.7.2"
+  }
+}
