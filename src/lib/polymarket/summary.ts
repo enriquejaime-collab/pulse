@@ -78,6 +78,7 @@ export interface PolymarketSummary {
     closedAt: string;
     eventTime: string | null;
     marketTitle: string;
+    marketUrl: string | null;
     pairStatus: "Paired" | "Missing Leg";
     result: "Won" | "Lost" | "Flat";
     upUnits: number;
@@ -130,6 +131,7 @@ interface ClosedLegAggregate {
 interface ClosedPairAggregate {
   marketTitle: string;
   closedAtMs: number;
+  marketUrl: string | null;
   legs: Record<"UP" | "DOWN", ClosedLegAggregate>;
 }
 
@@ -354,6 +356,76 @@ const getOutcomeKey = (trade: PolymarketTrade): string => {
   return trade.asset ?? trade.outcome ?? String(trade.outcomeIndex ?? "unknown-outcome");
 };
 
+const normalizePolymarketUrl = (value: string): string | null => {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return null;
+  }
+  if (trimmed.startsWith("https://polymarket.com/")) {
+    return trimmed;
+  }
+  if (trimmed.startsWith("http://polymarket.com/")) {
+    return `https://${trimmed.slice("http://".length)}`;
+  }
+  if (trimmed.startsWith("/event/")) {
+    return `https://polymarket.com${trimmed}`;
+  }
+  if (trimmed.startsWith("event/")) {
+    return `https://polymarket.com/${trimmed}`;
+  }
+  return null;
+};
+
+const looksLikeSlug = (value: string): boolean => /^[a-z0-9-]+$/i.test(value.trim());
+
+const buildPolymarketEventUrlFromSlugs = (eventSlugRaw: string, marketSlugRaw: string): string | null => {
+  const eventSlug = eventSlugRaw.trim();
+  const marketSlug = marketSlugRaw.trim();
+  if (!eventSlug || !marketSlug || !looksLikeSlug(eventSlug) || !looksLikeSlug(marketSlug)) {
+    return null;
+  }
+  return `https://polymarket.com/event/${eventSlug}/${marketSlug}`;
+};
+
+const getPolymarketEventUrlFromRecord = (record: Record<string, unknown>): string | null => {
+  const explicit = getStringFromKeys(record, [
+    "url",
+    "marketUrl",
+    "market_url",
+    "eventUrl",
+    "event_url",
+    "href",
+    "permalink",
+    "link"
+  ]);
+  const normalizedExplicit = explicit ? normalizePolymarketUrl(explicit) : null;
+  if (normalizedExplicit) {
+    return normalizedExplicit;
+  }
+
+  const eventSlug = getStringFromKeys(record, ["eventSlug", "event_slug", "event", "eventId", "event_id"]);
+  const marketSlug = getStringFromKeys(record, ["slug", "marketSlug", "market_slug"]);
+  const fullFromBoth = buildPolymarketEventUrlFromSlugs(eventSlug, marketSlug);
+  if (fullFromBoth) {
+    return fullFromBoth;
+  }
+
+  if (looksLikeSlug(marketSlug)) {
+    const fallback = buildPolymarketEventUrlFromSlugs(marketSlug, marketSlug);
+    if (fallback) {
+      return fallback;
+    }
+  }
+  if (looksLikeSlug(eventSlug)) {
+    const fallback = buildPolymarketEventUrlFromSlugs(eventSlug, eventSlug);
+    if (fallback) {
+      return fallback;
+    }
+  }
+
+  return null;
+};
+
 const normalizeTrade = (trade: PolymarketTrade): NormalizedTrade | null => {
   const sideRaw = (trade.side ?? "").toUpperCase();
   const side: NormalizedTrade["side"] = sideRaw === "BUY" ? "BUY" : sideRaw === "SELL" ? "SELL" : "OTHER";
@@ -413,6 +485,29 @@ const getPositionRealizedPnl = (position: PolymarketPosition): number => {
   );
 };
 
+const buildLatestMarketUrlByMarketTitle = (trades: PolymarketTrade[]): Map<string, string> => {
+  const best = new Map<string, { ts: number; url: string }>();
+
+  for (const trade of trades) {
+    const marketTitle = getMarketTitle(trade);
+    if (!marketTitle) {
+      continue;
+    }
+    const tradeRecord = trade as unknown as Record<string, unknown>;
+    const candidate = getPolymarketEventUrlFromRecord(tradeRecord);
+    if (!candidate) {
+      continue;
+    }
+    const ts = tryParseTimestampMs(trade.timestamp) ?? 0;
+    const current = best.get(marketTitle);
+    if (!current || ts >= current.ts) {
+      best.set(marketTitle, { ts, url: candidate });
+    }
+  }
+
+  return new Map(Array.from(best.entries()).map(([title, payload]) => [title, payload.url]));
+};
+
 const buildLatestTradeTimestampByMarket = (trades: PolymarketTrade[]): Map<string, number> => {
   const latestByMarket = new Map<string, number>();
   for (const trade of trades) {
@@ -428,6 +523,7 @@ const buildLatestTradeTimestampByMarket = (trades: PolymarketTrade[]): Map<strin
 
 const buildClosedPairRows = (closedPositions: PolymarketPosition[], trades: PolymarketTrade[]) => {
   const latestTradeByMarket = buildLatestTradeTimestampByMarket(trades);
+  const marketUrlByTitle = buildLatestMarketUrlByMarketTitle(trades);
   const byMarket = new Map<string, ClosedPairAggregate>();
 
   for (const position of closedPositions) {
@@ -467,11 +563,14 @@ const buildClosedPairRows = (closedPositions: PolymarketPosition[], trades: Poly
           asRecord.endDate
       ) ?? 0;
     const closedAtMs = Math.max(closedAtCandidate, latestTradeByMarket.get(marketTitle) ?? 0);
+    const marketUrlFromPosition = getPolymarketEventUrlFromRecord(asRecord);
+    const marketUrlFallback = marketUrlByTitle.get(marketTitle) ?? null;
 
     if (!byMarket.has(marketTitle)) {
       byMarket.set(marketTitle, {
         marketTitle,
         closedAtMs,
+        marketUrl: marketUrlFromPosition ?? marketUrlFallback,
         legs: {
           UP: { units: 0, cost: 0, pnl: 0 },
           DOWN: { units: 0, cost: 0, pnl: 0 }
@@ -485,6 +584,11 @@ const buildClosedPairRows = (closedPositions: PolymarketPosition[], trades: Poly
     }
 
     aggregate.closedAtMs = Math.max(aggregate.closedAtMs, closedAtMs);
+    if (!aggregate.marketUrl && marketUrlFromPosition) {
+      aggregate.marketUrl = marketUrlFromPosition;
+    } else if (!aggregate.marketUrl && marketUrlFallback) {
+      aggregate.marketUrl = marketUrlFallback;
+    }
     aggregate.legs[direction].units += units;
     aggregate.legs[direction].cost += cost;
     aggregate.legs[direction].pnl += pnl;
@@ -529,6 +633,7 @@ const buildClosedPairRows = (closedPositions: PolymarketPosition[], trades: Poly
         closedAt: new Date(pair.closedAtMs > 0 ? pair.closedAtMs : Date.now()).toISOString(),
         eventTime: eventStartMs ? new Date(eventStartMs).toISOString() : null,
         marketTitle: pair.marketTitle,
+        marketUrl: pair.marketUrl,
         pairStatus,
         result,
         upUnits: up.units,

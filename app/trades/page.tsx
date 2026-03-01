@@ -50,6 +50,7 @@ interface PolymarketSummaryResponse {
     closedAt: string;
     eventTime: string | null;
     marketTitle: string;
+    marketUrl: string | null;
     pairStatus: "Paired" | "Missing Leg";
     result: "Won" | "Lost" | "Flat";
     upUnits: number;
@@ -1130,9 +1131,21 @@ export default function TradesPage() {
                         {row.result}
                       </td>
                       <td className="border-b border-slate-100 px-3 py-2 text-slate-700">
-                        <p className="whitespace-nowrap text-[0.9rem] leading-snug text-slate-800" title={row.marketTitle}>
-                          {row.marketTitle}
-                        </p>
+                        {row.marketUrl ? (
+                          <a
+                            href={row.marketUrl}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="whitespace-nowrap text-[0.9rem] leading-snug text-slate-800 hover:text-emerald-700 hover:underline underline-offset-2"
+                            title={`Open on Polymarket: ${row.marketTitle}`}
+                          >
+                            {row.marketTitle}
+                          </a>
+                        ) : (
+                          <p className="whitespace-nowrap text-[0.9rem] leading-snug text-slate-800" title={row.marketTitle}>
+                            {row.marketTitle}
+                          </p>
+                        )}
                       </td>
                       <td className="border-b border-slate-100 px-3 py-2 text-slate-700">
                         {row.upUnits > 0 ? (
