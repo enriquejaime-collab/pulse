@@ -822,7 +822,7 @@ export const getPolymarketSummary = async (wallet: string): Promise<PolymarketSu
   const [trades, closedPositions, openPositions, activity] = await Promise.all([
     fetchPaginated<PolymarketTrade>("/trades", wallet, {
       pageSize: 50,
-      maxOffset: 1000,
+      maxOffset: 100_000,
       dedupeKey: (row) => {
         const trade = row as PolymarketTrade;
         return (
