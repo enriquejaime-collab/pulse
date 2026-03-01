@@ -1,7 +1,6 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import Link from "next/link";
 import { PageShell } from "@/app/components/page-shell";
 
 interface PolymarketSummaryResponse {
@@ -458,14 +457,11 @@ const metricColor = (value: number): string => {
 };
 
 export default function TradesPage() {
-  const [walletInput, setWalletInput] = useState("");
   const [summary, setSummary] = useState<PolymarketSummaryResponse | null>(null);
   const [properties, setProperties] = useState<PersistedProperty[]>([]);
-  const [persistenceBackend, setPersistenceBackend] = useState<"supabase" | "local" | "unknown">("unknown");
   const [selectedPropertyId, setSelectedPropertyId] = useState("");
   const [selectedWalletId, setSelectedWalletId] = useState("");
   const [isPropertiesLoading, setIsPropertiesLoading] = useState(false);
-  const [lastSyncSource, setLastSyncSource] = useState<"live" | "cache" | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [closedRowsVisible, setClosedRowsVisible] = useState(50);
@@ -657,7 +653,6 @@ export default function TradesPage() {
       const response = await fetch("/api/properties");
       const payload = (await response.json()) as {
         properties?: PersistedProperty[];
-        backend?: "supabase" | "local";
         error?: string;
       };
       if (!response.ok) {
@@ -666,7 +661,6 @@ export default function TradesPage() {
 
       const nextProperties = payload.properties ?? [];
       setProperties(nextProperties);
-      setPersistenceBackend(payload.backend ?? "unknown");
 
       const resolvedPropertyId =
         preferredPropertyId && nextProperties.some((property) => property.id === preferredPropertyId)
@@ -687,7 +681,7 @@ export default function TradesPage() {
 
       const selectedWallet = walletsForProperty.find((wallet) => wallet.id === resolvedWalletId);
       if (selectedWallet) {
-        setWalletInput(selectedWallet.wallet);
+        // no-op: wallet is sourced from stored wallet profile on sync
       }
       return nextProperties;
     } catch (loadError) {
@@ -738,88 +732,37 @@ export default function TradesPage() {
     setQuickAnchorEndMs(floorToHourMs(Date.now()));
   }, [comparisonMode, comparisonDurationPreset, comparisonCustomHours]);
 
-  const onLoadCachedSummary = async () => {
-    const wallet = selectedWalletProfile?.wallet ?? walletInput.trim().toLowerCase();
+  const onFetchSummary = async () => {
     if (!selectedPropertyId) {
       setError("Select a property first.");
+      setSummary(null);
       return;
     }
+    const wallet = selectedWalletProfile?.wallet ?? "";
     if (!wallet) {
-      setError("Select a wallet profile first.");
+      setError("Select a stored wallet first.");
+      setSummary(null);
       return;
     }
+
     setIsLoading(true);
     setError(null);
+
     try {
-      const response = await fetch(
-        `/api/properties/${encodeURIComponent(selectedPropertyId)}/summary?wallet=${encodeURIComponent(wallet)}`
-      );
+      const response = await fetch(`/api/properties/${encodeURIComponent(selectedPropertyId)}/sync`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ wallet, forceRefresh: true })
+      });
       const payload = (await response.json()) as {
-        snapshot?: { summary: PolymarketSummaryResponse } | null;
+        summary?: PolymarketSummaryResponse;
         error?: string;
       };
-      if (!response.ok) {
-        throw new Error(payload.error ?? "Failed to load cached snapshot.");
+      if (!response.ok || !payload.summary) {
+        throw new Error(payload.error ?? "Failed to sync wallet.");
       }
-      if (!payload.snapshot?.summary) {
-        throw new Error("No cached snapshot found for this wallet yet.");
-      }
-      setSummary(payload.snapshot.summary);
-      setLastSyncSource("cache");
-      setWalletInput(wallet);
-    } catch (cachedError) {
-      const message = cachedError instanceof Error ? cachedError.message : "Failed to load cached summary.";
-      setError(message);
-      setSummary(null);
-    } finally {
-      setIsLoading(false);
-    }
-  };
-
-  const onFetchSummary = async () => {
-    const wallet = walletInput.trim().toLowerCase();
-    if (!wallet) {
-      setError("Enter your wallet address first.");
-      setSummary(null);
-      return;
-    }
-
-    setIsLoading(true);
-    setError(null);
-
-    try {
-      if (selectedPropertyId) {
-        const response = await fetch(`/api/properties/${encodeURIComponent(selectedPropertyId)}/sync`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ wallet, forceRefresh: true })
-        });
-        const payload = (await response.json()) as {
-          source?: "live" | "cache";
-          summary?: PolymarketSummaryResponse;
-          error?: string;
-        };
-        if (!response.ok || !payload.summary) {
-          throw new Error(payload.error ?? "Failed to sync wallet.");
-        }
-        setSummary(payload.summary);
-        setLastSyncSource(payload.source ?? "live");
-        await loadProperties(selectedPropertyId);
-      } else {
-        const response = await fetch(`/api/polymarket/summary?wallet=${encodeURIComponent(wallet)}`);
-        const payload = (await response.json()) as unknown;
-
-        if (!response.ok) {
-          const errorMessage =
-            payload && typeof payload === "object" && "error" in payload && typeof payload.error === "string"
-              ? payload.error
-              : "Failed to fetch Polymarket data.";
-          throw new Error(errorMessage);
-        }
-
-        setSummary(payload as PolymarketSummaryResponse);
-        setLastSyncSource("live");
-      }
+      setSummary(payload.summary);
+      await loadProperties(selectedPropertyId, selectedWalletId);
     } catch (fetchError) {
       setSummary(null);
       const message = fetchError instanceof Error ? fetchError.message : "Network error while loading your summary.";
@@ -852,9 +795,6 @@ export default function TradesPage() {
                   setSelectedPropertyId(propertyId);
                   const nextWallet = properties.find((property) => property.id === propertyId)?.wallets[0] ?? null;
                   setSelectedWalletId(nextWallet?.id ?? "");
-                  if (nextWallet) {
-                    setWalletInput(nextWallet.wallet);
-                  }
                 }}
                 className="mt-1.5 h-11 w-full rounded-lg border border-slate-300 bg-white px-3 text-sm text-slate-800"
               >
@@ -873,10 +813,6 @@ export default function TradesPage() {
                 onChange={(event) => {
                   const walletId = event.target.value;
                   setSelectedWalletId(walletId);
-                  const wallet = selectedProperty?.wallets.find((row) => row.id === walletId);
-                  if (wallet) {
-                    setWalletInput(wallet.wallet);
-                  }
                 }}
                 className="mt-1.5 h-11 w-full rounded-lg border border-slate-300 bg-white px-3 text-sm text-slate-800"
                 disabled={!selectedProperty}
@@ -891,53 +827,17 @@ export default function TradesPage() {
             </div>
           </div>
 
-          <div className="mt-3 flex flex-wrap items-center gap-2">
-            <button
-              type="button"
-              onClick={onLoadCachedSummary}
-              disabled={isLoading || !selectedPropertyId}
-              className="inline-flex h-11 items-center justify-center rounded-lg border border-slate-300 bg-white px-4 text-sm font-medium text-slate-800 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
-            >
-              Load Cached
-            </button>
-            <Link
-              href="/settings"
-              className="inline-flex h-11 items-center justify-center rounded-lg border border-slate-300 bg-white px-4 text-sm font-medium text-slate-800 transition hover:bg-slate-50"
-            >
-              Manage Properties
-            </Link>
-          </div>
-          <p className="mt-2 text-xs text-slate-500">Load Cached uses the latest stored snapshot without calling the live API.</p>
-
-          <p className="mt-3 text-xs text-slate-500">
-            Persistence backend: <span className="font-medium text-slate-700">{persistenceBackend}</span>
-            {isPropertiesLoading ? " · loading properties..." : ""}
-            {lastSyncSource ? (
-              <>
-                {" "}
-                · Last summary source:{" "}
-                <span className="font-medium text-slate-700">{lastSyncSource === "live" ? "live sync" : "cache"}</span>
-              </>
-            ) : null}
-          </p>
-        </div>
-
-        <div className="mt-4 flex flex-col gap-3 sm:flex-row">
-          <input
-            type="text"
-            placeholder="0x..."
-            value={walletInput}
-            onChange={(event) => setWalletInput(event.target.value)}
-            className="h-11 w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-800"
-          />
+          <div className="mt-4 flex items-center justify-end">
           <button
             type="button"
             onClick={onFetchSummary}
-            disabled={isLoading}
+            disabled={isLoading || !selectedPropertyId || !selectedWalletId}
             className="inline-flex h-11 items-center justify-center rounded-xl border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-800 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
           >
-            {isLoading ? "Syncing..." : selectedPropertyId ? "Sync + Fetch" : "Fetch"}
+            {isLoading ? "Syncing..." : "Sync + Fetch"}
           </button>
+        </div>
+        <p className="mt-2 text-xs text-slate-500">{isPropertiesLoading ? "Loading properties..." : ""}</p>
         </div>
 
         {error && <p className="mt-4 text-sm font-medium text-red-700">{error}</p>}
