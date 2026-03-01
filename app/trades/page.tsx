@@ -785,8 +785,8 @@ export default function TradesPage() {
         </p>
 
         <div className="mt-5 rounded-2xl border border-slate-200/90 bg-white/70 p-4">
-          <div className="grid gap-3 lg:grid-cols-2">
-            <div>
+          <div className="flex flex-col gap-3 lg:flex-row lg:items-end">
+            <div className="lg:w-64">
               <label className="text-xs font-medium uppercase tracking-wide text-slate-500">Property</label>
               <select
                 value={selectedPropertyId}
@@ -806,7 +806,7 @@ export default function TradesPage() {
                 ))}
               </select>
             </div>
-            <div>
+            <div className="lg:w-[30rem]">
               <label className="text-xs font-medium uppercase tracking-wide text-slate-500">Stored Wallet</label>
               <select
                 value={selectedWalletId}
@@ -825,19 +825,16 @@ export default function TradesPage() {
                 ))}
               </select>
             </div>
+            <button
+              type="button"
+              onClick={onFetchSummary}
+              disabled={isLoading || !selectedPropertyId || !selectedWalletId}
+              className="inline-flex h-11 items-center justify-center rounded-xl border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-800 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {isLoading ? "Syncing..." : "Sync + Fetch"}
+            </button>
           </div>
-
-          <div className="mt-4 flex items-center justify-end">
-          <button
-            type="button"
-            onClick={onFetchSummary}
-            disabled={isLoading || !selectedPropertyId || !selectedWalletId}
-            className="inline-flex h-11 items-center justify-center rounded-xl border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-800 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
-          >
-            {isLoading ? "Syncing..." : "Sync + Fetch"}
-          </button>
-        </div>
-        <p className="mt-2 text-xs text-slate-500">{isPropertiesLoading ? "Loading properties..." : ""}</p>
+          <p className="mt-2 text-xs text-slate-500">{isPropertiesLoading ? "Loading properties..." : ""}</p>
         </div>
 
         {error && <p className="mt-4 text-sm font-medium text-red-700">{error}</p>}
