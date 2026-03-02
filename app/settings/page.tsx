@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 import { PageShell } from "@/app/components/page-shell";
 
 interface WalletProfile {
@@ -22,10 +22,108 @@ interface PropertyModel {
   wallets: WalletProfile[];
 }
 
+interface WalletSyncStateModel {
+  id: string;
+  propertyId: string;
+  wallet: string;
+  status: "idle" | "syncing" | "success" | "error";
+  lastRunId: string | null;
+  consecutiveFailures: number;
+  lastSyncAt: string | null;
+  lastSuccessAt: string | null;
+  lastError: string | null;
+  recordsIngested: number;
+  updatedAt: string;
+}
+
+interface ReliabilityReport {
+  pass: boolean;
+  status?: "pass" | "pass_with_trade_drift" | "mismatch";
+  strictPass?: boolean;
+  tolerance?: {
+    tradeDeltaSoft?: number;
+  };
+  checkedAt: string;
+  deltas: {
+    trades: number;
+    closedPositions: number;
+    wins: number;
+    losses: number;
+  };
+}
+
+interface WalletReliabilityState {
+  isLoading: boolean;
+  report: ReliabilityReport | null;
+  error: string | null;
+}
+
 const WALLET_PATTERN = /^0x[a-f0-9]{40}$/i;
+
+const formatRelativeDate = (value: string | null): string => {
+  if (!value) {
+    return "never";
+  }
+  const ms = Date.parse(value);
+  if (!Number.isFinite(ms)) {
+    return "never";
+  }
+  return new Date(ms).toLocaleString(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit"
+  });
+};
+
+const syncStatusClass = (status: WalletSyncStateModel["status"] | undefined): string => {
+  if (status === "success") {
+    return "border-emerald-200 bg-emerald-50 text-emerald-700";
+  }
+  if (status === "error") {
+    return "border-red-200 bg-red-50 text-red-700";
+  }
+  if (status === "syncing") {
+    return "border-blue-200 bg-blue-50 text-blue-700";
+  }
+  return "border-slate-200 bg-white text-slate-600";
+};
+
+const reliabilityStatusClass = (report: ReliabilityReport | null): string => {
+  if (!report) {
+    return "border-slate-200 bg-white text-slate-600";
+  }
+  if (report.status === "mismatch") {
+    return "border-amber-200 bg-amber-50 text-amber-800";
+  }
+  if (report.status === "pass_with_trade_drift") {
+    return "border-blue-200 bg-blue-50 text-blue-700";
+  }
+  if (report.pass) {
+    return "border-emerald-200 bg-emerald-50 text-emerald-700";
+  }
+  return "border-slate-200 bg-white text-slate-600";
+};
+
+const reliabilityStatusLabel = (report: ReliabilityReport | null): string => {
+  if (!report) {
+    return "Not checked";
+  }
+  if (report.status === "pass_with_trade_drift") {
+    return "Pass (trade drift)";
+  }
+  if (report.status === "mismatch") {
+    return "Mismatch";
+  }
+  return report.pass ? "Pass" : "Unknown";
+};
+
+const buildWalletReliabilityKey = (propertyId: string, wallet: string): string => `${propertyId}:${wallet.toLowerCase()}`;
 
 export default function SettingsPage() {
   const [properties, setProperties] = useState<PropertyModel[]>([]);
+  const [syncStatesByProperty, setSyncStatesByProperty] = useState<Record<string, WalletSyncStateModel[]>>({});
+  const [reliabilityByWallet, setReliabilityByWallet] = useState<Record<string, WalletReliabilityState>>({});
   const [backend, setBackend] = useState<"supabase" | "local" | "unknown">("unknown");
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -42,7 +140,35 @@ export default function SettingsPage() {
     [properties, editingPropertyId]
   );
 
-  const loadProperties = async () => {
+  const loadSyncStatesForProperties = useCallback(async (items: PropertyModel[]) => {
+    if (items.length === 0) {
+      setSyncStatesByProperty({});
+      return;
+    }
+
+    const entries = await Promise.all(
+      items.map(async (property) => {
+        try {
+          const response = await fetch(`/api/properties/${encodeURIComponent(property.id)}/sync-state`, {
+            cache: "no-store"
+          });
+          const payload = (await response.json()) as {
+            syncStates?: WalletSyncStateModel[];
+          };
+          if (!response.ok) {
+            return [property.id, []] as const;
+          }
+          return [property.id, payload.syncStates ?? []] as const;
+        } catch {
+          return [property.id, []] as const;
+        }
+      })
+    );
+
+    setSyncStatesByProperty(Object.fromEntries(entries));
+  }, []);
+
+  const loadProperties = useCallback(async () => {
     setIsLoading(true);
     setError(null);
     try {
@@ -55,19 +181,21 @@ export default function SettingsPage() {
       if (!response.ok) {
         throw new Error(payload.error ?? "Failed to load properties.");
       }
-      setProperties(payload.properties ?? []);
+      const nextProperties = payload.properties ?? [];
+      setProperties(nextProperties);
       setBackend(payload.backend ?? "unknown");
+      await loadSyncStatesForProperties(nextProperties);
     } catch (loadError) {
       const message = loadError instanceof Error ? loadError.message : "Failed to load properties.";
       setError(message);
     } finally {
       setIsLoading(false);
     }
-  };
+  }, [loadSyncStatesForProperties]);
 
   useEffect(() => {
     void loadProperties();
-  }, []);
+  }, [loadProperties]);
 
   const onCreateProperty = async (event: FormEvent) => {
     event.preventDefault();
@@ -195,6 +323,50 @@ export default function SettingsPage() {
     }
   };
 
+  const onRunReliabilityCheck = async (propertyId: string, wallet: string) => {
+    const key = buildWalletReliabilityKey(propertyId, wallet);
+    setReliabilityByWallet((previous) => ({
+      ...previous,
+      [key]: {
+        isLoading: true,
+        report: previous[key]?.report ?? null,
+        error: null
+      }
+    }));
+
+    try {
+      const response = await fetch(`/api/properties/${encodeURIComponent(propertyId)}/reliability`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ wallet })
+      });
+      const payload = (await response.json()) as ReliabilityReport & { error?: string };
+
+      if (!response.ok) {
+        throw new Error(payload.error ?? "Reliability check failed.");
+      }
+
+      setReliabilityByWallet((previous) => ({
+        ...previous,
+        [key]: {
+          isLoading: false,
+          report: payload,
+          error: null
+        }
+      }));
+    } catch (checkError) {
+      const message = checkError instanceof Error ? checkError.message : "Reliability check failed.";
+      setReliabilityByWallet((previous) => ({
+        ...previous,
+        [key]: {
+          isLoading: false,
+          report: previous[key]?.report ?? null,
+          error: message
+        }
+      }));
+    }
+  };
+
   return (
     <PageShell
       title="Settings"
@@ -217,6 +389,11 @@ export default function SettingsPage() {
         <div className="mt-5 space-y-3">
           {properties.map((property) => {
             const isEditing = editingPropertyId === property.id;
+            const propertySyncStates = syncStatesByProperty[property.id] ?? [];
+            const syncStateByWallet = new Map(
+              propertySyncStates.map((state) => [state.wallet.toLowerCase(), state] as const)
+            );
+            const successCount = propertySyncStates.filter((state) => state.status === "success").length;
             return (
               <article key={property.id} className="rounded-xl border border-slate-200/90 bg-white/70 p-4">
                 <div className="flex items-center justify-between gap-3">
@@ -225,6 +402,11 @@ export default function SettingsPage() {
                     <p className="text-xs text-slate-500">
                       {property.wallets.length} wallet{property.wallets.length === 1 ? "" : "s"}
                     </p>
+                    {property.wallets.length > 0 && (
+                      <p className="mt-1 text-xs text-slate-500">
+                        Sync healthy: {successCount}/{property.wallets.length}
+                      </p>
+                    )}
                   </div>
                   <button
                     type="button"
@@ -237,67 +419,172 @@ export default function SettingsPage() {
 
                 {property.wallets.length > 0 && (
                   <div className="mt-3 flex flex-wrap gap-2">
-                    {property.wallets.map((wallet) => (
-                      <div key={wallet.id} className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white px-3 py-1.5">
-                        <span className="text-xs font-medium text-slate-700">
-                          {wallet.label ? `${wallet.label} · ` : ""}
-                          {wallet.wallet.slice(0, 10)}...{wallet.wallet.slice(-4)}
-                        </span>
-                        {isEditing && (
-                          <button
-                            type="button"
-                            onClick={() => onDeleteWallet(property.id, wallet.wallet)}
-                            className="text-xs font-medium text-slate-500 hover:text-red-600"
+                    {property.wallets.map((wallet) => {
+                      const state = syncStateByWallet.get(wallet.wallet.toLowerCase());
+                      return (
+                        <div
+                          key={wallet.id}
+                          className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white px-3 py-1.5"
+                        >
+                          <span className="text-xs font-medium text-slate-700">
+                            {wallet.label ? `${wallet.label} · ` : ""}
+                            {wallet.wallet.slice(0, 10)}...{wallet.wallet.slice(-4)}
+                          </span>
+                          <span
+                            className={`rounded-full border px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide ${syncStatusClass(
+                              state?.status
+                            )}`}
                           >
-                            Remove
-                          </button>
-                        )}
-                      </div>
-                    ))}
+                            {state?.status ?? "idle"}
+                          </span>
+                          <span className="text-[11px] text-slate-500">
+                            {state?.status === "success"
+                              ? `Last success ${formatRelativeDate(state.lastSuccessAt)}`
+                              : state?.status === "error"
+                                ? "Needs retry"
+                                : "Not synced"}
+                          </span>
+                          {isEditing && (
+                            <button
+                              type="button"
+                              onClick={() => onDeleteWallet(property.id, wallet.wallet)}
+                              className="text-xs font-medium text-slate-500 hover:text-red-600"
+                            >
+                              Remove
+                            </button>
+                          )}
+                        </div>
+                      );
+                    })}
                   </div>
                 )}
 
                 {isEditing && (
-                  <div className="mt-4 grid gap-4 lg:grid-cols-2">
-                    <form onSubmit={onSavePropertyName} className="rounded-lg border border-slate-200 bg-white/80 p-3">
-                      <label className="text-xs font-medium uppercase tracking-wide text-slate-500">Property Name</label>
-                      <input
-                        value={editingName}
-                        onChange={(event) => setEditingName(event.target.value)}
-                        className="mt-1.5 h-11 w-full rounded-lg border border-slate-300 bg-white px-3 text-sm text-slate-800"
-                      />
-                      <button
-                        type="submit"
-                        disabled={isSubmitting}
-                        className="mt-3 inline-flex h-10 items-center justify-center rounded-lg border border-slate-300 bg-white px-3 text-sm font-medium text-slate-700 transition hover:bg-slate-50 disabled:opacity-60"
-                      >
-                        Save Name
-                      </button>
-                    </form>
+                  <>
+                    <div className="mt-4 grid gap-4 lg:grid-cols-2">
+                      <form onSubmit={onSavePropertyName} className="rounded-lg border border-slate-200 bg-white/80 p-3">
+                        <label className="text-xs font-medium uppercase tracking-wide text-slate-500">Property Name</label>
+                        <input
+                          value={editingName}
+                          onChange={(event) => setEditingName(event.target.value)}
+                          className="mt-1.5 h-11 w-full rounded-lg border border-slate-300 bg-white px-3 text-sm text-slate-800"
+                        />
+                        <button
+                          type="submit"
+                          disabled={isSubmitting}
+                          className="mt-3 inline-flex h-10 items-center justify-center rounded-lg border border-slate-300 bg-white px-3 text-sm font-medium text-slate-700 transition hover:bg-slate-50 disabled:opacity-60"
+                        >
+                          Save Name
+                        </button>
+                      </form>
 
-                    <form onSubmit={onAddWallet} className="rounded-lg border border-slate-200 bg-white/80 p-3">
-                      <label className="text-xs font-medium uppercase tracking-wide text-slate-500">Add Wallet</label>
-                      <input
-                        placeholder="0x..."
-                        value={walletInput}
-                        onChange={(event) => setWalletInput(event.target.value)}
-                        className="mt-1.5 h-11 w-full rounded-lg border border-slate-300 bg-white px-3 text-sm text-slate-800"
-                      />
-                      <input
-                        placeholder="Alias (optional)"
-                        value={walletAliasInput}
-                        onChange={(event) => setWalletAliasInput(event.target.value)}
-                        className="mt-2 h-11 w-full rounded-lg border border-slate-300 bg-white px-3 text-sm text-slate-800"
-                      />
-                      <button
-                        type="submit"
-                        disabled={isSubmitting}
-                        className="mt-3 inline-flex h-10 items-center justify-center rounded-lg border border-slate-300 bg-white px-3 text-sm font-medium text-slate-700 transition hover:bg-slate-50 disabled:opacity-60"
-                      >
-                        Save Wallet
-                      </button>
-                    </form>
-                  </div>
+                      <form onSubmit={onAddWallet} className="rounded-lg border border-slate-200 bg-white/80 p-3">
+                        <label className="text-xs font-medium uppercase tracking-wide text-slate-500">Add Wallet</label>
+                        <input
+                          placeholder="0x..."
+                          value={walletInput}
+                          onChange={(event) => setWalletInput(event.target.value)}
+                          className="mt-1.5 h-11 w-full rounded-lg border border-slate-300 bg-white px-3 text-sm text-slate-800"
+                        />
+                        <input
+                          placeholder="Alias (optional)"
+                          value={walletAliasInput}
+                          onChange={(event) => setWalletAliasInput(event.target.value)}
+                          className="mt-2 h-11 w-full rounded-lg border border-slate-300 bg-white px-3 text-sm text-slate-800"
+                        />
+                        <button
+                          type="submit"
+                          disabled={isSubmitting}
+                          className="mt-3 inline-flex h-10 items-center justify-center rounded-lg border border-slate-300 bg-white px-3 text-sm font-medium text-slate-700 transition hover:bg-slate-50 disabled:opacity-60"
+                        >
+                          Save Wallet
+                        </button>
+                      </form>
+                    </div>
+
+                    {property.wallets.length > 0 && (
+                      <div className="mt-4 rounded-lg border border-slate-200 bg-white/80 p-3">
+                        <div className="flex items-center justify-between gap-2">
+                          <p className="text-xs font-medium uppercase tracking-wide text-slate-500">Wallet Diagnostics</p>
+                          <p className="text-[11px] text-slate-500">Run reliability checks outside the operator view.</p>
+                        </div>
+                        <div className="mt-3 space-y-2">
+                          {property.wallets.map((wallet) => {
+                            const key = buildWalletReliabilityKey(property.id, wallet.wallet);
+                            const reliabilityState = reliabilityByWallet[key];
+                            const reliabilityReport = reliabilityState?.report ?? null;
+                            return (
+                              <div
+                                key={`${wallet.id}-diagnostics`}
+                                className="rounded-lg border border-slate-200 bg-white px-3 py-2"
+                              >
+                                <div className="flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between">
+                                  <p className="text-sm font-medium text-slate-800">
+                                    {wallet.label ? `${wallet.label} · ` : ""}
+                                    {wallet.wallet.slice(0, 10)}...{wallet.wallet.slice(-4)}
+                                  </p>
+                                  <button
+                                    type="button"
+                                    onClick={() => void onRunReliabilityCheck(property.id, wallet.wallet)}
+                                    disabled={reliabilityState?.isLoading}
+                                    className="inline-flex h-9 items-center justify-center rounded-lg border border-slate-300 bg-white px-3 text-xs font-medium text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
+                                  >
+                                    {reliabilityState?.isLoading ? (
+                                      <span className="inline-flex items-center gap-2">
+                                        <span className="h-3 w-3 animate-spin rounded-full border-2 border-slate-300 border-t-slate-700" />
+                                        Checking
+                                      </span>
+                                    ) : (
+                                      "Run Reliability Check"
+                                    )}
+                                  </button>
+                                </div>
+                                <div className="mt-2 flex flex-wrap gap-2 text-xs">
+                                  <span
+                                    className={`rounded-full border px-2.5 py-1 font-medium ${reliabilityStatusClass(
+                                      reliabilityReport
+                                    )}`}
+                                  >
+                                    Reliability: {reliabilityStatusLabel(reliabilityReport)}
+                                  </span>
+                                  {reliabilityReport && (
+                                    <>
+                                      <span className="rounded-full border border-slate-200 bg-white px-2.5 py-1 font-medium text-slate-700">
+                                        Delta trades: {reliabilityReport.deltas.trades >= 0 ? "+" : ""}
+                                        {reliabilityReport.deltas.trades}
+                                      </span>
+                                      <span className="rounded-full border border-slate-200 bg-white px-2.5 py-1 font-medium text-slate-700">
+                                        Delta closed: {reliabilityReport.deltas.closedPositions >= 0 ? "+" : ""}
+                                        {reliabilityReport.deltas.closedPositions}
+                                      </span>
+                                      <span className="rounded-full border border-slate-200 bg-white px-2.5 py-1 font-medium text-slate-700">
+                                        Delta W/L: {reliabilityReport.deltas.wins >= 0 ? "+" : ""}
+                                        {reliabilityReport.deltas.wins}/{reliabilityReport.deltas.losses >= 0 ? "+" : ""}
+                                        {reliabilityReport.deltas.losses}
+                                      </span>
+                                      <span className="rounded-full border border-slate-200 bg-white px-2.5 py-1 font-medium text-slate-700">
+                                        Checked: {formatRelativeDate(reliabilityReport.checkedAt)}
+                                      </span>
+                                      {reliabilityReport.status === "pass_with_trade_drift" && (
+                                        <span className="rounded-full border border-blue-200 bg-blue-50 px-2.5 py-1 font-medium text-blue-700">
+                                          tolerance ±{reliabilityReport.tolerance?.tradeDeltaSoft ?? 10} trades
+                                        </span>
+                                      )}
+                                    </>
+                                  )}
+                                </div>
+                                {reliabilityState?.error && (
+                                  <p className="mt-2 text-xs font-medium text-red-700">
+                                    Reliability check error: {reliabilityState.error}
+                                  </p>
+                                )}
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    )}
+                  </>
                 )}
               </article>
             );

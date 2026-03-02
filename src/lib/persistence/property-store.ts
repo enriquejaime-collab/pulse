@@ -5,10 +5,16 @@ import type { PolymarketSummary } from "@/src/lib/polymarket/summary";
 import type {
   PropertyStore,
   PropertyWithWallets,
+  RawEndpoint,
+  RawRecordInput,
+  RawRecordUpsertResult,
+  StoredRawDataSets,
   StoredProperty,
+  StoredSyncRun,
   StoredWallet,
   StoredWalletSnapshot,
   StoredWalletSyncState,
+  SyncRunMode,
   WalletSyncStatus
 } from "@/src/lib/persistence/property-store-types";
 
@@ -54,6 +60,8 @@ const mapSyncStateRow = (row: Record<string, unknown>): StoredWalletSyncState =>
   propertyId: String(row.property_id ?? ""),
   wallet: String(row.wallet ?? "").toLowerCase(),
   status: String(row.status ?? "idle") as WalletSyncStatus,
+  lastRunId: typeof row.last_run_id === "string" ? row.last_run_id : null,
+  consecutiveFailures: Number(row.consecutive_failures ?? 0),
   lastSyncAt: typeof row.last_sync_at === "string" ? row.last_sync_at : null,
   lastSuccessAt: typeof row.last_success_at === "string" ? row.last_success_at : null,
   lastError: typeof row.last_error === "string" ? row.last_error : null,
@@ -61,7 +69,35 @@ const mapSyncStateRow = (row: Record<string, unknown>): StoredWalletSyncState =>
   updatedAt: toIsoString(row.updated_at)
 });
 
+const mapSyncRunRow = (row: Record<string, unknown>): StoredSyncRun => ({
+  id: String(row.id ?? ""),
+  propertyId: String(row.property_id ?? ""),
+  wallet: String(row.wallet ?? "").toLowerCase(),
+  mode: String(row.mode ?? "incremental") as SyncRunMode,
+  status: String(row.status ?? "idle") as WalletSyncStatus,
+  startedAt: toIsoString(row.started_at),
+  finishedAt: typeof row.finished_at === "string" ? row.finished_at : null,
+  recordsIngested: Number(row.records_ingested ?? 0),
+  error: typeof row.error === "string" ? row.error : null
+});
+
 const ensureWallet = (wallet: string): string => wallet.trim().toLowerCase();
+const RAW_TABLE_BY_ENDPOINT: Record<RawEndpoint, string> = {
+  trades: "raw_trades",
+  closed_positions: "raw_closed_positions",
+  positions: "raw_positions",
+  activity: "raw_activity"
+};
+
+const LOCAL_RAW_KEY_BY_ENDPOINT: Record<
+  RawEndpoint,
+  "rawTrades" | "rawClosedPositions" | "rawPositions" | "rawActivity"
+> = {
+  trades: "rawTrades",
+  closed_positions: "rawClosedPositions",
+  positions: "rawPositions",
+  activity: "rawActivity"
+};
 
 const isSupabaseConfigured = (): boolean => SUPABASE_URL.length > 0 && SUPABASE_SERVICE_ROLE_KEY.length > 0;
 
@@ -95,7 +131,11 @@ class SupabaseRestClient {
       return undefined as T;
     }
 
-    return (await response.json()) as T;
+    const raw = await response.text();
+    if (!raw) {
+      return undefined as T;
+    }
+    return JSON.parse(raw) as T;
   }
 
   get<T>(pathnameAndQuery: string): Promise<T> {
@@ -225,26 +265,195 @@ class SupabasePropertyStore implements PropertyStore {
     return mapSnapshotRow(rows[0] ?? {});
   }
 
+  async createSyncRun(input: {
+    propertyId: string;
+    wallet: string;
+    mode: SyncRunMode;
+    status?: WalletSyncStatus;
+  }): Promise<StoredSyncRun> {
+    const rows = await this.client.post<Record<string, unknown>[]>(
+      "/wallet_sync_runs",
+      {
+        property_id: input.propertyId,
+        wallet: ensureWallet(input.wallet),
+        mode: input.mode,
+        status: input.status ?? "syncing",
+        started_at: new Date().toISOString()
+      },
+      { Prefer: "return=representation" }
+    );
+    return mapSyncRunRow(rows[0] ?? {});
+  }
+
+  async finishSyncRun(
+    runId: string,
+    input: {
+      status: WalletSyncStatus;
+      recordsIngested?: number;
+      error?: string | null;
+      finishedAt?: string;
+    }
+  ): Promise<StoredSyncRun> {
+    const rows = await this.client.patch<Record<string, unknown>[]>(
+      `/wallet_sync_runs?id=eq.${runId}`,
+      {
+        status: input.status,
+        records_ingested: input.recordsIngested ?? 0,
+        error: input.error ?? null,
+        finished_at: input.finishedAt ?? new Date().toISOString()
+      },
+      { Prefer: "return=representation" }
+    );
+    return mapSyncRunRow(rows[0] ?? {});
+  }
+
+  async listSyncRuns(propertyId: string, wallet: string, limit = 20): Promise<StoredSyncRun[]> {
+    const normalized = ensureWallet(wallet);
+    const rows = await this.client.get<Record<string, unknown>[]>(
+      `/wallet_sync_runs?select=id,property_id,wallet,mode,status,started_at,finished_at,records_ingested,error&property_id=eq.${propertyId}&wallet=eq.${normalized}&order=started_at.desc&limit=${limit}`
+    );
+    return rows.map(mapSyncRunRow);
+  }
+
+  async listSyncStates(propertyId: string): Promise<StoredWalletSyncState[]> {
+    const rows = await this.client.get<Record<string, unknown>[]>(
+      `/wallet_sync_state?select=id,property_id,wallet,status,last_run_id,consecutive_failures,last_sync_at,last_success_at,last_error,records_ingested,updated_at&property_id=eq.${propertyId}&order=updated_at.desc`
+    );
+    return rows.map(mapSyncStateRow);
+  }
+
+  async saveRawRecords(input: {
+    propertyId: string;
+    wallet: string;
+    records: RawRecordInput[];
+  }): Promise<RawRecordUpsertResult[]> {
+    const normalizedWallet = ensureWallet(input.wallet);
+    const grouped = new Map<RawEndpoint, RawRecordInput[]>();
+    for (const record of input.records) {
+      if (!grouped.has(record.endpoint)) {
+        grouped.set(record.endpoint, []);
+      }
+      grouped.get(record.endpoint)?.push(record);
+    }
+
+    const results: RawRecordUpsertResult[] = [];
+    for (const [endpoint, records] of grouped.entries()) {
+      if (records.length === 0) {
+        continue;
+      }
+      // Supabase upsert fails when a single payload contains duplicate conflict keys.
+      // Keep the latest occurrence per record_id for this endpoint batch.
+      const dedupedByRecordId = new Map<string, RawRecordInput>();
+      for (const record of records) {
+        dedupedByRecordId.set(record.recordId, record);
+      }
+      const dedupedRecords = Array.from(dedupedByRecordId.values());
+
+      const table = RAW_TABLE_BY_ENDPOINT[endpoint];
+      const payload = dedupedRecords.map((record) => ({
+        property_id: input.propertyId,
+        wallet: normalizedWallet,
+        record_id: record.recordId,
+        event_timestamp: record.timestamp,
+        payload_json: record.payload
+      }));
+      await this.client.post<Record<string, unknown>[]>(
+        `/${table}?on_conflict=property_id,wallet,record_id`,
+        payload,
+        { Prefer: "resolution=merge-duplicates,return=minimal" }
+      );
+      results.push({ endpoint, processed: dedupedRecords.length });
+    }
+
+    return results;
+  }
+
+  async getRawDataSets(propertyId: string, wallet: string): Promise<StoredRawDataSets> {
+    const normalized = ensureWallet(wallet);
+    const fetchAllPayloadRows = async (table: string): Promise<Record<string, unknown>[]> => {
+      const pageSize = 1000;
+      const rows: Record<string, unknown>[] = [];
+      for (let offset = 0; ; offset += pageSize) {
+        const page = await this.client.get<Record<string, unknown>[]>(
+          `/${table}?select=payload_json&property_id=eq.${propertyId}&wallet=eq.${normalized}&order=event_timestamp.desc&limit=${pageSize}&offset=${offset}`
+        );
+        rows.push(...page);
+        if (page.length < pageSize) {
+          break;
+        }
+      }
+      return rows;
+    };
+
+    const [tradesRows, closedRows, openRows, activityRows] = await Promise.all([
+      fetchAllPayloadRows("raw_trades"),
+      fetchAllPayloadRows("raw_closed_positions"),
+      fetchAllPayloadRows("raw_positions"),
+      fetchAllPayloadRows("raw_activity")
+    ]);
+
+    const extractPayload = (row: Record<string, unknown>): Record<string, unknown> =>
+      (row.payload_json as Record<string, unknown>) ?? {};
+
+    return {
+      trades: tradesRows.map(extractPayload),
+      closedPositions: closedRows.map(extractPayload),
+      openPositions: openRows.map(extractPayload),
+      activity: activityRows.map(extractPayload)
+    };
+  }
+
+  async clearRawData(input: {
+    propertyId: string;
+    wallet: string;
+    endpoints?: RawEndpoint[];
+  }): Promise<void> {
+    const normalized = ensureWallet(input.wallet);
+    const endpoints = input.endpoints ?? ["trades", "closed_positions", "positions", "activity"];
+    for (const endpoint of endpoints) {
+      const table = RAW_TABLE_BY_ENDPOINT[endpoint];
+      await this.client.delete(`/${table}?property_id=eq.${input.propertyId}&wallet=eq.${normalized}`);
+    }
+  }
+
   async upsertSyncState(input: {
     propertyId: string;
     wallet: string;
     status: WalletSyncStatus;
+    lastRunId?: string | null;
+    consecutiveFailures?: number;
     lastSyncAt?: string | null;
     lastSuccessAt?: string | null;
     lastError?: string | null;
     recordsIngested?: number;
   }): Promise<StoredWalletSyncState> {
+    const payload: Record<string, unknown> = {
+      property_id: input.propertyId,
+      wallet: ensureWallet(input.wallet),
+      status: input.status
+    };
+    if (Object.prototype.hasOwnProperty.call(input, "lastRunId")) {
+      payload.last_run_id = input.lastRunId ?? null;
+    }
+    if (Object.prototype.hasOwnProperty.call(input, "consecutiveFailures")) {
+      payload.consecutive_failures = input.consecutiveFailures ?? 0;
+    }
+    if (Object.prototype.hasOwnProperty.call(input, "lastSyncAt")) {
+      payload.last_sync_at = input.lastSyncAt ?? null;
+    }
+    if (Object.prototype.hasOwnProperty.call(input, "lastSuccessAt")) {
+      payload.last_success_at = input.lastSuccessAt ?? null;
+    }
+    if (Object.prototype.hasOwnProperty.call(input, "lastError")) {
+      payload.last_error = input.lastError ?? null;
+    }
+    if (Object.prototype.hasOwnProperty.call(input, "recordsIngested")) {
+      payload.records_ingested = input.recordsIngested ?? 0;
+    }
+
     const rows = await this.client.post<Record<string, unknown>[]>(
       "/wallet_sync_state?on_conflict=property_id,wallet",
-      {
-        property_id: input.propertyId,
-        wallet: ensureWallet(input.wallet),
-        status: input.status,
-        last_sync_at: input.lastSyncAt ?? null,
-        last_success_at: input.lastSuccessAt ?? null,
-        last_error: input.lastError ?? null,
-        records_ingested: input.recordsIngested ?? 0
-      },
+      payload,
       { Prefer: "resolution=merge-duplicates,return=representation" }
     );
     return mapSyncStateRow(rows[0] ?? {});
@@ -253,7 +462,7 @@ class SupabasePropertyStore implements PropertyStore {
   async getSyncState(propertyId: string, wallet: string): Promise<StoredWalletSyncState | null> {
     const normalized = ensureWallet(wallet);
     const rows = await this.client.get<Record<string, unknown>[]>(
-      `/wallet_sync_state?select=id,property_id,wallet,status,last_sync_at,last_success_at,last_error,records_ingested,updated_at&property_id=eq.${propertyId}&wallet=eq.${normalized}&limit=1`
+      `/wallet_sync_state?select=id,property_id,wallet,status,last_run_id,consecutive_failures,last_sync_at,last_success_at,last_error,records_ingested,updated_at&property_id=eq.${propertyId}&wallet=eq.${normalized}&limit=1`
     );
     if (rows.length === 0) {
       return null;
@@ -293,11 +502,52 @@ interface LocalStoreDocument {
     propertyId: string;
     wallet: string;
     status: WalletSyncStatus;
+    lastRunId: string | null;
+    consecutiveFailures: number;
     lastSyncAt: string | null;
     lastSuccessAt: string | null;
     lastError: string | null;
     recordsIngested: number;
     updatedAt: string;
+  }>;
+  syncRuns: Array<{
+    id: string;
+    propertyId: string;
+    wallet: string;
+    mode: SyncRunMode;
+    status: WalletSyncStatus;
+    startedAt: string;
+    finishedAt: string | null;
+    recordsIngested: number;
+    error: string | null;
+  }>;
+  rawTrades: Array<{
+    propertyId: string;
+    wallet: string;
+    recordId: string;
+    timestamp: string | null;
+    payload: Record<string, unknown>;
+  }>;
+  rawClosedPositions: Array<{
+    propertyId: string;
+    wallet: string;
+    recordId: string;
+    timestamp: string | null;
+    payload: Record<string, unknown>;
+  }>;
+  rawPositions: Array<{
+    propertyId: string;
+    wallet: string;
+    recordId: string;
+    timestamp: string | null;
+    payload: Record<string, unknown>;
+  }>;
+  rawActivity: Array<{
+    propertyId: string;
+    wallet: string;
+    recordId: string;
+    timestamp: string | null;
+    payload: Record<string, unknown>;
   }>;
 }
 
@@ -305,7 +555,12 @@ const createEmptyLocalStore = (): LocalStoreDocument => ({
   properties: [],
   wallets: [],
   snapshots: [],
-  syncStates: []
+  syncStates: [],
+  syncRuns: [],
+  rawTrades: [],
+  rawClosedPositions: [],
+  rawPositions: [],
+  rawActivity: []
 });
 
 class LocalFilePropertyStore implements PropertyStore {
@@ -323,7 +578,34 @@ class LocalFilePropertyStore implements PropertyStore {
         properties: parsed.properties ?? [],
         wallets: parsed.wallets ?? [],
         snapshots: parsed.snapshots ?? [],
-        syncStates: parsed.syncStates ?? []
+        syncStates: (parsed.syncStates ?? []).map((state) => ({
+          id: String(state.id ?? randomUUID()),
+          propertyId: String(state.propertyId ?? ""),
+          wallet: ensureWallet(String(state.wallet ?? "")),
+          status: String(state.status ?? "idle") as WalletSyncStatus,
+          lastRunId: typeof state.lastRunId === "string" ? state.lastRunId : null,
+          consecutiveFailures: Number(state.consecutiveFailures ?? 0),
+          lastSyncAt: typeof state.lastSyncAt === "string" ? state.lastSyncAt : null,
+          lastSuccessAt: typeof state.lastSuccessAt === "string" ? state.lastSuccessAt : null,
+          lastError: typeof state.lastError === "string" ? state.lastError : null,
+          recordsIngested: Number(state.recordsIngested ?? 0),
+          updatedAt: toIsoString(state.updatedAt)
+        })),
+        syncRuns: (parsed.syncRuns ?? []).map((run) => ({
+          id: String(run.id ?? randomUUID()),
+          propertyId: String(run.propertyId ?? ""),
+          wallet: ensureWallet(String(run.wallet ?? "")),
+          mode: String(run.mode ?? "incremental") as SyncRunMode,
+          status: String(run.status ?? "idle") as WalletSyncStatus,
+          startedAt: toIsoString(run.startedAt),
+          finishedAt: typeof run.finishedAt === "string" ? run.finishedAt : null,
+          recordsIngested: Number(run.recordsIngested ?? 0),
+          error: typeof run.error === "string" ? run.error : null
+        })),
+        rawTrades: parsed.rawTrades ?? [],
+        rawClosedPositions: parsed.rawClosedPositions ?? [],
+        rawPositions: parsed.rawPositions ?? [],
+        rawActivity: parsed.rawActivity ?? []
       };
     } catch {
       return createEmptyLocalStore();
@@ -449,10 +731,156 @@ class LocalFilePropertyStore implements PropertyStore {
     return snapshot;
   }
 
+  async createSyncRun(input: {
+    propertyId: string;
+    wallet: string;
+    mode: SyncRunMode;
+    status?: WalletSyncStatus;
+  }): Promise<StoredSyncRun> {
+    const doc = await this.readStore();
+    const run: StoredSyncRun = {
+      id: randomUUID(),
+      propertyId: input.propertyId,
+      wallet: ensureWallet(input.wallet),
+      mode: input.mode,
+      status: input.status ?? "syncing",
+      startedAt: new Date().toISOString(),
+      finishedAt: null,
+      recordsIngested: 0,
+      error: null
+    };
+    doc.syncRuns.unshift(run);
+    await this.writeStore(doc);
+    return run;
+  }
+
+  async finishSyncRun(
+    runId: string,
+    input: {
+      status: WalletSyncStatus;
+      recordsIngested?: number;
+      error?: string | null;
+      finishedAt?: string;
+    }
+  ): Promise<StoredSyncRun> {
+    const doc = await this.readStore();
+    const run = doc.syncRuns.find((row) => row.id === runId);
+    if (!run) {
+      throw new Error("Sync run not found.");
+    }
+    run.status = input.status;
+    run.recordsIngested = input.recordsIngested ?? run.recordsIngested;
+    run.error = input.error ?? null;
+    run.finishedAt = input.finishedAt ?? new Date().toISOString();
+    await this.writeStore(doc);
+    return run;
+  }
+
+  async listSyncRuns(propertyId: string, wallet: string, limit = 20): Promise<StoredSyncRun[]> {
+    const doc = await this.readStore();
+    const normalizedWallet = ensureWallet(wallet);
+    return doc.syncRuns
+      .filter((run) => run.propertyId === propertyId && run.wallet === normalizedWallet)
+      .sort((a, b) => Date.parse(b.startedAt) - Date.parse(a.startedAt))
+      .slice(0, Math.max(limit, 0));
+  }
+
+  async listSyncStates(propertyId: string): Promise<StoredWalletSyncState[]> {
+    const doc = await this.readStore();
+    return doc.syncStates
+      .filter((state) => state.propertyId === propertyId)
+      .sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
+  }
+
+  async saveRawRecords(input: {
+    propertyId: string;
+    wallet: string;
+    records: RawRecordInput[];
+  }): Promise<RawRecordUpsertResult[]> {
+    const doc = await this.readStore();
+    const normalizedWallet = ensureWallet(input.wallet);
+    const resultsByEndpoint = new Map<RawEndpoint, number>();
+
+    for (const record of input.records) {
+      const key = LOCAL_RAW_KEY_BY_ENDPOINT[record.endpoint];
+      const collection = doc[key];
+      const existingIndex = collection.findIndex(
+        (row) =>
+          row.propertyId === input.propertyId && row.wallet === normalizedWallet && row.recordId === record.recordId
+      );
+      const nextRow = {
+        propertyId: input.propertyId,
+        wallet: normalizedWallet,
+        recordId: record.recordId,
+        timestamp: record.timestamp,
+        payload: record.payload
+      };
+
+      if (existingIndex >= 0) {
+        collection[existingIndex] = nextRow;
+      } else {
+        collection.push(nextRow);
+      }
+      resultsByEndpoint.set(record.endpoint, (resultsByEndpoint.get(record.endpoint) ?? 0) + 1);
+    }
+
+    await this.writeStore(doc);
+    return Array.from(resultsByEndpoint.entries()).map(([endpoint, processed]) => ({ endpoint, processed }));
+  }
+
+  async getRawDataSets(propertyId: string, wallet: string): Promise<StoredRawDataSets> {
+    const doc = await this.readStore();
+    const normalizedWallet = ensureWallet(wallet);
+
+    const byTimestampDesc = <T extends { timestamp: string | null }>(rows: T[]): T[] =>
+      rows
+        .slice()
+        .sort((a, b) => Date.parse(b.timestamp ?? "") - Date.parse(a.timestamp ?? ""));
+
+    const selectPayload = (
+      rows: Array<{
+        propertyId: string;
+        wallet: string;
+        payload: Record<string, unknown>;
+      }>
+    ): Record<string, unknown>[] =>
+      rows
+        .filter((row) => row.propertyId === propertyId && row.wallet === normalizedWallet)
+        .map((row) => row.payload);
+
+    return {
+      trades: selectPayload(byTimestampDesc(doc.rawTrades)),
+      closedPositions: selectPayload(byTimestampDesc(doc.rawClosedPositions)),
+      openPositions: selectPayload(byTimestampDesc(doc.rawPositions)),
+      activity: selectPayload(byTimestampDesc(doc.rawActivity))
+    };
+  }
+
+  async clearRawData(input: {
+    propertyId: string;
+    wallet: string;
+    endpoints?: RawEndpoint[];
+  }): Promise<void> {
+    const doc = await this.readStore();
+    const normalizedWallet = ensureWallet(input.wallet);
+    const endpoints = input.endpoints ?? ["trades", "closed_positions", "positions", "activity"];
+
+    for (const endpoint of endpoints) {
+      const key = LOCAL_RAW_KEY_BY_ENDPOINT[endpoint];
+      doc[key] = doc[key].filter(
+        (row) => !(row.propertyId === input.propertyId && row.wallet === normalizedWallet)
+      );
+    }
+
+    await this.writeStore(doc);
+  }
+
   async upsertSyncState(input: {
     propertyId: string;
     wallet: string;
     status: WalletSyncStatus;
+    lastRunId?: string | null;
+    consecutiveFailures?: number;
     lastSyncAt?: string | null;
     lastSuccessAt?: string | null;
     lastError?: string | null;
@@ -466,10 +894,24 @@ class LocalFilePropertyStore implements PropertyStore {
     );
     if (existing) {
       existing.status = input.status;
-      existing.lastSyncAt = input.lastSyncAt ?? existing.lastSyncAt;
-      existing.lastSuccessAt = input.lastSuccessAt ?? existing.lastSuccessAt;
-      existing.lastError = input.lastError ?? null;
-      existing.recordsIngested = input.recordsIngested ?? existing.recordsIngested;
+      if (Object.prototype.hasOwnProperty.call(input, "lastRunId")) {
+        existing.lastRunId = input.lastRunId ?? null;
+      }
+      if (Object.prototype.hasOwnProperty.call(input, "consecutiveFailures")) {
+        existing.consecutiveFailures = input.consecutiveFailures ?? 0;
+      }
+      if (Object.prototype.hasOwnProperty.call(input, "lastSyncAt")) {
+        existing.lastSyncAt = input.lastSyncAt ?? null;
+      }
+      if (Object.prototype.hasOwnProperty.call(input, "lastSuccessAt")) {
+        existing.lastSuccessAt = input.lastSuccessAt ?? null;
+      }
+      if (Object.prototype.hasOwnProperty.call(input, "lastError")) {
+        existing.lastError = input.lastError ?? null;
+      }
+      if (Object.prototype.hasOwnProperty.call(input, "recordsIngested")) {
+        existing.recordsIngested = input.recordsIngested ?? 0;
+      }
       existing.updatedAt = now;
       await this.writeStore(doc);
       return existing;
@@ -480,6 +922,8 @@ class LocalFilePropertyStore implements PropertyStore {
       propertyId: input.propertyId,
       wallet: normalizedWallet,
       status: input.status,
+      lastRunId: input.lastRunId ?? null,
+      consecutiveFailures: input.consecutiveFailures ?? 0,
       lastSyncAt: input.lastSyncAt ?? null,
       lastSuccessAt: input.lastSuccessAt ?? null,
       lastError: input.lastError ?? null,

@@ -94,6 +94,32 @@ interface PersistedProperty {
   wallets: PersistedWalletProfile[];
 }
 
+interface WalletSyncStateModel {
+  id: string;
+  propertyId: string;
+  wallet: string;
+  status: "idle" | "syncing" | "success" | "error";
+  lastRunId: string | null;
+  consecutiveFailures: number;
+  lastSyncAt: string | null;
+  lastSuccessAt: string | null;
+  lastError: string | null;
+  recordsIngested: number;
+  updatedAt: string;
+}
+
+interface SyncRunModel {
+  id: string;
+  propertyId: string;
+  wallet: string;
+  mode: "full" | "incremental";
+  status: "idle" | "syncing" | "success" | "error";
+  startedAt: string;
+  finishedAt: string | null;
+  recordsIngested: number;
+  error: string | null;
+}
+
 const formatUsd = (value: number): string =>
   new Intl.NumberFormat("en-US", {
     style: "currency",
@@ -177,6 +203,23 @@ const formatWindowLabel = (startMs: number | null, endMs: number | null): string
     minute: "2-digit"
   });
   return `${startText} to ${endText}`;
+};
+
+const formatEtDateTime = (value: string | null): string => {
+  if (!value) {
+    return "-";
+  }
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return "-";
+  }
+  return date.toLocaleString(undefined, {
+    timeZone: MARKET_TIME_ZONE,
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit"
+  });
 };
 
 const getDateRangeBounds = (
@@ -456,6 +499,19 @@ const metricColor = (value: number): string => {
   return "text-slate-700";
 };
 
+const syncStatusPillClass = (status: WalletSyncStateModel["status"] | null): string => {
+  if (status === "success") {
+    return "border-emerald-200 bg-emerald-50 text-emerald-700";
+  }
+  if (status === "error") {
+    return "border-red-200 bg-red-50 text-red-700";
+  }
+  if (status === "syncing") {
+    return "border-blue-200 bg-blue-50 text-blue-700";
+  }
+  return "border-slate-200 bg-white text-slate-700";
+};
+
 export default function TradesPage() {
   const [summary, setSummary] = useState<PolymarketSummaryResponse | null>(null);
   const [properties, setProperties] = useState<PersistedProperty[]>([]);
@@ -464,6 +520,10 @@ export default function TradesPage() {
   const [isPropertiesLoading, setIsPropertiesLoading] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [syncState, setSyncState] = useState<WalletSyncStateModel | null>(null);
+  const [syncRuns, setSyncRuns] = useState<SyncRunModel[]>([]);
+  const [lastSummarySource, setLastSummarySource] = useState<"live" | "cache" | null>(null);
+  const [lastSyncMode, setLastSyncMode] = useState<"full" | "incremental" | null>(null);
   const [closedRowsVisible, setClosedRowsVisible] = useState(50);
   const [strategyFilter, setStrategyFilter] = useState<"all" | "btc_updown" | "eth_updown" | "custom">("all");
   const [customStrategyFilter, setCustomStrategyFilter] = useState("");
@@ -494,6 +554,7 @@ export default function TradesPage() {
     () => selectedProperty?.wallets.find((wallet) => wallet.id === selectedWalletId) ?? null,
     [selectedProperty, selectedWalletId]
   );
+  const latestSyncRun = useMemo(() => syncRuns[0] ?? null, [syncRuns]);
 
   const strategyClosedRows = useMemo(() => {
     if (!summary) {
@@ -693,10 +754,68 @@ export default function TradesPage() {
     }
   };
 
+  const loadSyncTelemetry = async (propertyId: string, wallet: string) => {
+    if (!propertyId || !wallet) {
+      setSyncState(null);
+      setSyncRuns([]);
+      return;
+    }
+
+    try {
+      const [stateResponse, runsResponse] = await Promise.all([
+        fetch(
+          `/api/properties/${encodeURIComponent(propertyId)}/sync-state?wallet=${encodeURIComponent(wallet)}`,
+          { cache: "no-store" }
+        ),
+        fetch(
+          `/api/properties/${encodeURIComponent(propertyId)}/sync-runs?wallet=${encodeURIComponent(wallet)}&limit=5`,
+          { cache: "no-store" }
+        )
+      ]);
+
+      const statePayload = (await stateResponse.json()) as {
+        syncState?: WalletSyncStateModel | null;
+        latestRun?: SyncRunModel | null;
+      };
+      const runsPayload = (await runsResponse.json()) as {
+        runs?: SyncRunModel[];
+      };
+
+      if (stateResponse.ok) {
+        setSyncState(statePayload.syncState ?? null);
+      }
+      if (runsResponse.ok) {
+        const runs = runsPayload.runs ?? [];
+        setSyncRuns(runs);
+        setLastSyncMode(runs[0]?.mode ?? null);
+      } else if (statePayload.latestRun) {
+        setSyncRuns([statePayload.latestRun]);
+        setLastSyncMode(statePayload.latestRun.mode);
+      }
+    } catch {
+      // telemetry errors should not interrupt the main trading summary flow
+    }
+  };
+
   useEffect(() => {
     void loadProperties();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    const wallet = selectedWalletProfile?.wallet ?? "";
+    if (!selectedPropertyId || !wallet) {
+      setSyncState(null);
+      setSyncRuns([]);
+      setLastSummarySource(null);
+      setLastSyncMode(null);
+      return;
+    }
+    setLastSummarySource(null);
+    setLastSyncMode(null);
+    void loadSyncTelemetry(selectedPropertyId, wallet);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedPropertyId, selectedWalletProfile?.wallet]);
 
   useEffect(() => {
     setClosedRowsVisible(50);
@@ -755,16 +874,26 @@ export default function TradesPage() {
         body: JSON.stringify({ wallet, forceRefresh: true })
       });
       const payload = (await response.json()) as {
+        source?: "live" | "cache";
+        mode?: "full" | "incremental";
         summary?: PolymarketSummaryResponse;
+        syncState?: WalletSyncStateModel | null;
+        syncRuns?: SyncRunModel[];
         error?: string;
       };
       if (!response.ok || !payload.summary) {
         throw new Error(payload.error ?? "Failed to sync wallet.");
       }
       setSummary(payload.summary);
+      setSyncState(payload.syncState ?? null);
+      setSyncRuns(payload.syncRuns ?? []);
+      setLastSummarySource(payload.source ?? "live");
+      setLastSyncMode(payload.mode ?? (payload.syncRuns?.[0]?.mode ?? null));
       await loadProperties(selectedPropertyId, selectedWalletId);
     } catch (fetchError) {
       setSummary(null);
+      setLastSummarySource(null);
+      setLastSyncMode(null);
       const message = fetchError instanceof Error ? fetchError.message : "Network error while loading your summary.";
       setError(message);
     } finally {
@@ -840,7 +969,40 @@ export default function TradesPage() {
             )}
           </button>
         </div>
+        <div className="mt-3 flex flex-wrap items-center gap-2 text-xs">
+          <span className={`rounded-full border px-2.5 py-1 font-medium ${syncStatusPillClass(syncState?.status ?? null)}`}>
+            Sync status: {syncState?.status ?? "idle"}
+          </span>
+          {lastSummarySource && (
+            <span className="rounded-full border border-slate-200 bg-white px-2.5 py-1 font-medium text-slate-700">
+              Last summary source: {lastSummarySource}
+            </span>
+          )}
+          {(lastSyncMode ?? latestSyncRun?.mode) && (
+            <span className="rounded-full border border-slate-200 bg-white px-2.5 py-1 font-medium text-slate-700">
+              Mode: {lastSyncMode ?? latestSyncRun?.mode}
+            </span>
+          )}
+          {syncState?.lastSuccessAt && (
+            <span className="rounded-full border border-slate-200 bg-white px-2.5 py-1 font-medium text-slate-700">
+              Last success: {formatEtDateTime(syncState.lastSuccessAt)} ET
+            </span>
+          )}
+          {latestSyncRun && (
+            <span className="rounded-full border border-slate-200 bg-white px-2.5 py-1 font-medium text-slate-700">
+              Last run ingested: {latestSyncRun.recordsIngested.toLocaleString()} rows
+            </span>
+          )}
+          {typeof syncState?.consecutiveFailures === "number" && syncState.consecutiveFailures > 0 && (
+            <span className="rounded-full border border-amber-200 bg-amber-50 px-2.5 py-1 font-medium text-amber-800">
+              {syncState.consecutiveFailures} consecutive failure{syncState.consecutiveFailures === 1 ? "" : "s"}
+            </span>
+          )}
+        </div>
         <p className="mt-2 text-xs text-slate-500">{isPropertiesLoading ? "Loading properties..." : ""}</p>
+        {syncState?.lastError && (
+          <p className="mt-1 text-xs text-red-700">Last sync error: {syncState.lastError}</p>
+        )}
 
         {error && <p className="mt-4 text-sm font-medium text-red-700">{error}</p>}
       </section>

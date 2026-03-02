@@ -1,6 +1,6 @@
 const POLYMARKET_DATA_API_BASE_URL = "https://data-api.polymarket.com";
 
-interface PolymarketTrade {
+export interface PolymarketTrade {
   id?: string;
   side?: string;
   size?: number | string;
@@ -20,16 +20,17 @@ interface PolymarketTrade {
   question?: string;
 }
 
-interface PolymarketPosition {
+export interface PolymarketPosition {
   [key: string]: unknown;
   realizedPnl?: number | string;
   cashPnl?: number | string;
 }
 
-interface PolymarketActivity {
+export interface PolymarketActivity {
   [key: string]: unknown;
   type?: string;
   usdcSize?: number | string;
+  timestamp?: number | string;
 }
 
 export interface PolymarketSummary {
@@ -103,6 +104,23 @@ export interface PolymarketSummary {
     activity: number;
   };
 }
+
+export const getTradeCanonicalKey = (trade: PolymarketTrade): string => {
+  const outcomeToken = String(trade.asset ?? trade.outcome ?? trade.outcomeIndex ?? "");
+  const marketToken = String(trade.conditionId ?? trade.marketId ?? trade.market ?? trade.slug ?? "");
+  return [
+    String(trade.id ?? ""),
+    String(trade.transactionHash ?? ""),
+    String(trade.timestamp ?? ""),
+    outcomeToken,
+    String(trade.side ?? ""),
+    String(trade.size ?? ""),
+    String(trade.price ?? ""),
+    marketToken
+  ]
+    .map((part) => part.trim().toLowerCase())
+    .join("|");
+};
 
 interface NormalizedTrade {
   id: string;
@@ -271,6 +289,9 @@ interface FetchOptions {
   dedupeKey?: (row: unknown) => string;
   nonFatalStatuses?: number[];
   queryParams?: Record<string, string | number | boolean>;
+  maxPages?: number;
+  stopWhenAllRowsOlderThanMs?: number;
+  getRowTimestampMs?: (row: unknown) => number | null;
 }
 
 const dedupeRows = <T>(rows: T[], dedupeKey?: (row: unknown) => string): T[] => {
@@ -294,10 +315,14 @@ const dedupeRows = <T>(rows: T[], dedupeKey?: (row: unknown) => string): T[] => 
 const fetchPaginated = async <T>(endpoint: string, wallet: string, options: FetchOptions = {}): Promise<T[]> => {
   const pageSize = options.pageSize ?? 50;
   const maxOffset = options.maxOffset ?? 10_000;
+  const maxPages = options.maxPages ?? Number.POSITIVE_INFINITY;
   const nonFatalStatuses = new Set(options.nonFatalStatuses ?? []);
   const allRows: T[] = [];
 
   for (let page = 0; ; page += 1) {
+    if (page >= maxPages) {
+      break;
+    }
     const offset = page * pageSize;
     if (offset > maxOffset) {
       break;
@@ -327,6 +352,18 @@ const fetchPaginated = async <T>(endpoint: string, wallet: string, options: Fetc
     const payload = (await response.json()) as unknown;
     const rows = extractArray<T>(payload);
     allRows.push(...rows);
+
+    const stopWhenAllRowsOlderThanMs = options.stopWhenAllRowsOlderThanMs;
+    const getRowTimestampMs = options.getRowTimestampMs;
+    if (stopWhenAllRowsOlderThanMs !== undefined && getRowTimestampMs && rows.length > 0) {
+      const isAllOlder = rows.every((row) => {
+        const timestampMs = getRowTimestampMs(row);
+        return timestampMs !== null && timestampMs !== undefined && timestampMs <= stopWhenAllRowsOlderThanMs;
+      });
+      if (isAllOlder) {
+        break;
+      }
+    }
 
     if (rows.length < pageSize) {
       break;
@@ -909,31 +946,57 @@ const buildPairExecutionFromClosedRows = (
   };
 };
 
-export const getPolymarketSummary = async (wallet: string): Promise<PolymarketSummary> => {
+export interface PolymarketSummaryDataSets {
+  trades: PolymarketTrade[];
+  closedPositions: PolymarketPosition[];
+  openPositions: PolymarketPosition[];
+  activity: PolymarketActivity[];
+}
+
+export interface PolymarketFetchModeOptions {
+  mode?: "full" | "incremental";
+}
+
+export const fetchPolymarketSummaryDataSets = async (
+  wallet: string,
+  options: PolymarketFetchModeOptions = {}
+): Promise<PolymarketSummaryDataSets> => {
+  const mode = options.mode ?? "full";
+  // Incremental mode intentionally caps depth to keep sync fast. Full mode walks all pages.
+  const maxPages = mode === "incremental" ? 200 : Number.POSITIVE_INFINITY;
+
   const [trades, closedPositions, openPositions, activity] = await Promise.all([
     fetchPaginated<PolymarketTrade>("/trades", wallet, {
-      pageSize: 500,
+      pageSize: 50,
       maxOffset: 100_000,
+      maxPages,
       nonFatalStatuses: [400],
       queryParams: { takerOnly: false },
-      dedupeKey: (row) => {
-        const trade = row as PolymarketTrade;
-        return (
-          trade.id ??
-          `${trade.transactionHash ?? "tx"}:${trade.timestamp ?? "ts"}:${trade.asset ?? "asset"}:${
-            trade.side ?? "side"
-          }:${trade.size ?? "size"}:${trade.price ?? "price"}`
-        );
-      }
+      dedupeKey: (row) => getTradeCanonicalKey(row as PolymarketTrade)
     }),
-    fetchPaginated<PolymarketPosition>("/closed-positions", wallet, { pageSize: 50, maxOffset: 100_000 }),
+    fetchPaginated<PolymarketPosition>("/closed-positions", wallet, {
+      pageSize: 50,
+      maxOffset: 100_000,
+      maxPages
+    }),
+    // Open positions are relatively small and represent current state, so always fetch full set.
     fetchPaginated<PolymarketPosition>("/positions", wallet, { pageSize: 50, maxOffset: 100_000 }),
     fetchPaginated<PolymarketActivity>("/activity", wallet, {
       pageSize: 50,
       maxOffset: 100_000,
+      maxPages,
       nonFatalStatuses: [400, 404]
     })
   ]);
+
+  return { trades, closedPositions, openPositions, activity };
+};
+
+export const buildPolymarketSummaryFromDataSets = (
+  wallet: string,
+  dataSets: PolymarketSummaryDataSets
+): PolymarketSummary => {
+  const { trades, closedPositions, openPositions, activity } = dataSets;
 
   const totalVolumeUsd = trades.reduce((total, trade) => total + toNumber(trade.price) * toNumber(trade.size), 0);
   const tradesWithFeeRate = trades.filter((trade) => toNumber(trade.fee_rate_bps) > 0);
@@ -1003,4 +1066,9 @@ export const getPolymarketSummary = async (wallet: string): Promise<PolymarketSu
       activity: activity.length
     }
   };
+};
+
+export const getPolymarketSummary = async (wallet: string): Promise<PolymarketSummary> => {
+  const dataSets = await fetchPolymarketSummaryDataSets(wallet, { mode: "full" });
+  return buildPolymarketSummaryFromDataSets(wallet, dataSets);
 };
