@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { FormEvent, useCallback, useEffect, useState } from "react";
 import { PageShell } from "@/app/components/page-shell";
 
 interface WalletProfile {
@@ -9,6 +9,9 @@ interface WalletProfile {
   wallet: string;
   label: string | null;
   strategyTag: string | null;
+  syncEnabled: boolean;
+  syncIntervalMinutes: number;
+  autoHealEnabled: boolean;
   createdAt: string;
   updatedAt: string;
 }
@@ -33,6 +36,9 @@ interface WalletSyncStateModel {
   lastSuccessAt: string | null;
   lastError: string | null;
   recordsIngested: number;
+  reliabilityStatus: "pass" | "pass_with_trade_drift" | "mismatch" | null;
+  reliabilityCheckedAt: string | null;
+  reliabilityTradeDelta: number | null;
   updatedAt: string;
 }
 
@@ -56,6 +62,28 @@ interface WalletReliabilityState {
   isLoading: boolean;
   report: ReliabilityReport | null;
   error: string | null;
+}
+
+interface SchedulerDueWallet {
+  propertyId: string;
+  propertyName: string;
+  wallet: string;
+  label: string | null;
+  syncIntervalMinutes: number;
+  autoHealEnabled: boolean;
+  lastSuccessAt: string | null;
+  lastSyncAt: string | null;
+  status: string | null;
+  reliabilityStatus: "pass" | "pass_with_trade_drift" | "mismatch" | null;
+  reliabilityCheckedAt: string | null;
+  dueReason: "never_synced" | "interval_elapsed" | "sync_error";
+  overdueMinutes: number;
+}
+
+interface WalletPolicyDraft {
+  syncEnabled: boolean;
+  syncIntervalMinutes: number;
+  autoHealEnabled: boolean;
 }
 
 const WALLET_PATTERN = /^0x[a-f0-9]{40}$/i;
@@ -89,7 +117,7 @@ const syncStatusClass = (status: WalletSyncStateModel["status"] | undefined): st
   return "border-slate-200 bg-white text-slate-600";
 };
 
-const reliabilityStatusClass = (report: ReliabilityReport | null): string => {
+const reliabilityReportClass = (report: ReliabilityReport | null): string => {
   if (!report) {
     return "border-slate-200 bg-white text-slate-600";
   }
@@ -105,7 +133,7 @@ const reliabilityStatusClass = (report: ReliabilityReport | null): string => {
   return "border-slate-200 bg-white text-slate-600";
 };
 
-const reliabilityStatusLabel = (report: ReliabilityReport | null): string => {
+const reliabilityReportLabel = (report: ReliabilityReport | null): string => {
   if (!report) {
     return "Not checked";
   }
@@ -119,11 +147,72 @@ const reliabilityStatusLabel = (report: ReliabilityReport | null): string => {
 };
 
 const buildWalletReliabilityKey = (propertyId: string, wallet: string): string => `${propertyId}:${wallet.toLowerCase()}`;
+const STALE_MULTIPLIER = 3;
+const SYNC_INTERVAL_OPTIONS = [5, 10, 15, 30, 60, 120, 240, 360, 720];
+
+const isWalletStale = (state: WalletSyncStateModel | undefined, intervalMinutes: number): boolean => {
+  if (!state?.lastSuccessAt) {
+    return false;
+  }
+  const lastSuccessMs = Date.parse(state.lastSuccessAt);
+  if (!Number.isFinite(lastSuccessMs)) {
+    return false;
+  }
+  return Date.now() - lastSuccessMs > intervalMinutes * STALE_MULTIPLIER * 60 * 1000;
+};
+
+const getDueReasonLabel = (dueReason: SchedulerDueWallet["dueReason"]): string => {
+  if (dueReason === "sync_error") {
+    return "retry after error";
+  }
+  if (dueReason === "never_synced") {
+    return "first sync";
+  }
+  return "interval elapsed";
+};
+
+const reliabilityStateClass = (
+  status: WalletSyncStateModel["reliabilityStatus"]
+): string => {
+  if (status === "mismatch") {
+    return "border-amber-200 bg-amber-50 text-amber-800";
+  }
+  if (status === "pass_with_trade_drift") {
+    return "border-blue-200 bg-blue-50 text-blue-700";
+  }
+  if (status === "pass") {
+    return "border-emerald-200 bg-emerald-50 text-emerald-700";
+  }
+  return "border-slate-200 bg-white text-slate-600";
+};
+
+const reliabilityStateLabel = (
+  status: WalletSyncStateModel["reliabilityStatus"]
+): string => {
+  if (status === "mismatch") {
+    return "mismatch";
+  }
+  if (status === "pass_with_trade_drift") {
+    return "pass (drift)";
+  }
+  if (status === "pass") {
+    return "pass";
+  }
+  return "not checked";
+};
+
+const formatWalletShort = (wallet: string): string => `${wallet.slice(0, 10)}...${wallet.slice(-4)}`;
 
 export default function SettingsPage() {
   const [properties, setProperties] = useState<PropertyModel[]>([]);
   const [syncStatesByProperty, setSyncStatesByProperty] = useState<Record<string, WalletSyncStateModel[]>>({});
   const [reliabilityByWallet, setReliabilityByWallet] = useState<Record<string, WalletReliabilityState>>({});
+  const [walletPolicyDrafts, setWalletPolicyDrafts] = useState<Record<string, WalletPolicyDraft>>({});
+  const [walletPolicySavingKey, setWalletPolicySavingKey] = useState<string | null>(null);
+  const [dueWallets, setDueWallets] = useState<SchedulerDueWallet[]>([]);
+  const [isDueWalletsLoading, setIsDueWalletsLoading] = useState(false);
+  const [isSchedulerRunning, setIsSchedulerRunning] = useState(false);
+  const [schedulerStatus, setSchedulerStatus] = useState<string | null>(null);
   const [backend, setBackend] = useState<"supabase" | "local" | "unknown">("unknown");
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -134,11 +223,6 @@ export default function SettingsPage() {
   const [walletInput, setWalletInput] = useState("");
   const [walletAliasInput, setWalletAliasInput] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
-
-  const editingProperty = useMemo(
-    () => properties.find((property) => property.id === editingPropertyId) ?? null,
-    [properties, editingPropertyId]
-  );
 
   const loadSyncStatesForProperties = useCallback(async (items: PropertyModel[]) => {
     if (items.length === 0) {
@@ -193,9 +277,29 @@ export default function SettingsPage() {
     }
   }, [loadSyncStatesForProperties]);
 
+  const loadDueWallets = useCallback(async () => {
+    setIsDueWalletsLoading(true);
+    try {
+      const response = await fetch("/api/ops/sync-due", { cache: "no-store" });
+      const payload = (await response.json()) as { dueWallets?: SchedulerDueWallet[] };
+      if (!response.ok) {
+        return;
+      }
+      setDueWallets(payload.dueWallets ?? []);
+    } catch {
+      // best-effort diagnostics only
+    } finally {
+      setIsDueWalletsLoading(false);
+    }
+  }, []);
+
   useEffect(() => {
     void loadProperties();
   }, [loadProperties]);
+
+  useEffect(() => {
+    void loadDueWallets();
+  }, [loadDueWallets]);
 
   const onCreateProperty = async (event: FormEvent) => {
     event.preventDefault();
@@ -219,6 +323,7 @@ export default function SettingsPage() {
       setNewPropertyName("");
       setIsCreateFormOpen(false);
       await loadProperties();
+      await loadDueWallets();
     } catch (submitError) {
       const message = submitError instanceof Error ? submitError.message : "Failed to create property.";
       setError(message);
@@ -233,6 +338,18 @@ export default function SettingsPage() {
     setWalletInput("");
     setWalletAliasInput("");
     setError(null);
+    const nextDrafts: Record<string, WalletPolicyDraft> = {};
+    for (const wallet of property.wallets) {
+      nextDrafts[buildWalletReliabilityKey(property.id, wallet.wallet)] = {
+        syncEnabled: wallet.syncEnabled,
+        syncIntervalMinutes: wallet.syncIntervalMinutes,
+        autoHealEnabled: wallet.autoHealEnabled
+      };
+    }
+    setWalletPolicyDrafts((previous) => ({
+      ...previous,
+      ...nextDrafts
+    }));
   };
 
   const onSavePropertyName = async (event: FormEvent) => {
@@ -258,6 +375,7 @@ export default function SettingsPage() {
         throw new Error(payload.error ?? "Failed to update property.");
       }
       await loadProperties();
+      await loadDueWallets();
     } catch (submitError) {
       const message = submitError instanceof Error ? submitError.message : "Failed to update property.";
       setError(message);
@@ -294,6 +412,7 @@ export default function SettingsPage() {
       setWalletInput("");
       setWalletAliasInput("");
       await loadProperties();
+      await loadDueWallets();
     } catch (submitError) {
       const message = submitError instanceof Error ? submitError.message : "Failed to save wallet.";
       setError(message);
@@ -315,6 +434,7 @@ export default function SettingsPage() {
         throw new Error(payload.error ?? "Failed to remove wallet.");
       }
       await loadProperties();
+      await loadDueWallets();
     } catch (submitError) {
       const message = submitError instanceof Error ? submitError.message : "Failed to remove wallet.";
       setError(message);
@@ -354,6 +474,8 @@ export default function SettingsPage() {
           error: null
         }
       }));
+      await loadProperties();
+      await loadDueWallets();
     } catch (checkError) {
       const message = checkError instanceof Error ? checkError.message : "Reliability check failed.";
       setReliabilityByWallet((previous) => ({
@@ -364,6 +486,92 @@ export default function SettingsPage() {
           error: message
         }
       }));
+    }
+  };
+
+  const onSaveWalletPolicy = async (propertyId: string, wallet: string) => {
+    const key = buildWalletReliabilityKey(propertyId, wallet);
+    const draft = walletPolicyDrafts[key];
+    if (!draft) {
+      return;
+    }
+    setWalletPolicySavingKey(key);
+    setError(null);
+    try {
+      const response = await fetch(`/api/properties/${encodeURIComponent(propertyId)}/wallets`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          wallet,
+          syncEnabled: draft.syncEnabled,
+          syncIntervalMinutes: draft.syncIntervalMinutes,
+          autoHealEnabled: draft.autoHealEnabled
+        })
+      });
+      const payload = (await response.json()) as { error?: string };
+      if (!response.ok) {
+        throw new Error(payload.error ?? "Failed to update wallet policy.");
+      }
+      await loadProperties();
+      await loadDueWallets();
+    } catch (policyError) {
+      const message = policyError instanceof Error ? policyError.message : "Failed to update wallet policy.";
+      setError(message);
+    } finally {
+      setWalletPolicySavingKey(null);
+    }
+  };
+
+  const onUpdateWalletPolicyDraft = (
+    propertyId: string,
+    wallet: string,
+    patch: Partial<WalletPolicyDraft>
+  ) => {
+    const key = buildWalletReliabilityKey(propertyId, wallet);
+    setWalletPolicyDrafts((previous) => {
+      const current = previous[key];
+      if (!current) {
+        return previous;
+      }
+      return {
+        ...previous,
+        [key]: {
+          ...current,
+          ...patch
+        }
+      };
+    });
+  };
+
+  const onRunSchedulerNow = async () => {
+    setIsSchedulerRunning(true);
+    setSchedulerStatus(null);
+    try {
+      const response = await fetch("/api/ops/sync-due?maxWallets=50", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" }
+      });
+      const payload = (await response.json()) as {
+        attempted?: number;
+        success?: number;
+        failed?: number;
+        healed?: number;
+        remainingDue?: number;
+        error?: string;
+      };
+      if (!response.ok) {
+        throw new Error(payload.error ?? "Failed to run scheduler.");
+      }
+      setSchedulerStatus(
+        `Scheduler run: ${payload.success ?? 0}/${payload.attempted ?? 0} ok, ${payload.failed ?? 0} failed, ${payload.healed ?? 0} healed, ${payload.remainingDue ?? 0} remaining due.`
+      );
+      await loadProperties();
+      await loadDueWallets();
+    } catch (schedulerError) {
+      const message = schedulerError instanceof Error ? schedulerError.message : "Failed to run scheduler.";
+      setSchedulerStatus(message);
+    } finally {
+      setIsSchedulerRunning(false);
     }
   };
 
@@ -386,7 +594,80 @@ export default function SettingsPage() {
           </p>
         </div>
 
-        <div className="mt-5 space-y-3">
+        <div className="mt-5 rounded-xl border border-slate-200/90 bg-white/70 p-4">
+          <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+            <div>
+              <p className="text-xs font-semibold uppercase tracking-wide text-slate-600">Sync Automation</p>
+              <p className="mt-1 text-sm text-slate-600">
+                Due wallets run incremental sync first, then reliability check, with optional auto-heal full sync.
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() => void onRunSchedulerNow()}
+              disabled={isSchedulerRunning}
+              className="inline-flex h-10 items-center justify-center rounded-lg border border-slate-300 bg-white px-4 text-sm font-medium text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {isSchedulerRunning ? (
+                <span className="inline-flex items-center gap-2">
+                  <span className="h-3 w-3 animate-spin rounded-full border-2 border-slate-300 border-t-slate-700" />
+                  Running
+                </span>
+              ) : (
+                "Run Due Sync Now"
+              )}
+            </button>
+          </div>
+
+          <div className="mt-3 flex flex-wrap gap-2 text-xs">
+            <span className="rounded-full border border-slate-200 bg-white px-2.5 py-1 font-medium text-slate-700">
+              Due wallets: {isDueWalletsLoading ? "..." : dueWallets.length}
+            </span>
+            {dueWallets.length > 0 && (
+              <span className="rounded-full border border-slate-200 bg-white px-2.5 py-1 font-medium text-slate-700">
+                Most overdue: {Math.max(...dueWallets.map((row) => row.overdueMinutes)).toLocaleString()} min
+              </span>
+            )}
+          </div>
+          {schedulerStatus && <p className="mt-2 text-xs text-slate-600">{schedulerStatus}</p>}
+
+          {dueWallets.length > 0 && (
+            <div className="mt-3 space-y-2">
+              {dueWallets.slice(0, 8).map((due) => (
+                <div
+                  key={`${due.propertyId}:${due.wallet}`}
+                  className="grid gap-2 rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs lg:grid-cols-[minmax(0,1fr)_auto_auto_auto]"
+                >
+                  <p className="font-medium text-slate-800">
+                    {due.propertyName} · {due.label ? `${due.label} · ` : ""}
+                    {formatWalletShort(due.wallet)}
+                  </p>
+                  <p className="text-slate-600">
+                    {getDueReasonLabel(due.dueReason)} · overdue {due.overdueMinutes.toLocaleString()} min
+                  </p>
+                  <p className="text-slate-600">
+                    every {due.syncIntervalMinutes} min · auto-heal {due.autoHealEnabled ? "on" : "off"}
+                  </p>
+                  <span
+                    className={`inline-flex w-fit items-center rounded-full border px-2 py-0.5 font-medium ${reliabilityStateClass(
+                      due.reliabilityStatus
+                    )}`}
+                  >
+                    reliability: {reliabilityStateLabel(due.reliabilityStatus)}
+                  </span>
+                </div>
+              ))}
+              {dueWallets.length > 8 && (
+                <p className="text-xs text-slate-500">Showing 8 of {dueWallets.length} due wallets.</p>
+              )}
+            </div>
+          )}
+          {!isDueWalletsLoading && dueWallets.length === 0 && (
+            <p className="mt-3 text-xs text-slate-500">All wallets are currently within their sync interval.</p>
+          )}
+        </div>
+
+        <div className="mt-4 space-y-3">
           {properties.map((property) => {
             const isEditing = editingPropertyId === property.id;
             const propertySyncStates = syncStatesByProperty[property.id] ?? [];
@@ -421,6 +702,7 @@ export default function SettingsPage() {
                   <div className="mt-3 flex flex-wrap gap-2">
                     {property.wallets.map((wallet) => {
                       const state = syncStateByWallet.get(wallet.wallet.toLowerCase());
+                      const stale = isWalletStale(state, wallet.syncIntervalMinutes);
                       return (
                         <div
                           key={wallet.id}
@@ -428,7 +710,7 @@ export default function SettingsPage() {
                         >
                           <span className="text-xs font-medium text-slate-700">
                             {wallet.label ? `${wallet.label} · ` : ""}
-                            {wallet.wallet.slice(0, 10)}...{wallet.wallet.slice(-4)}
+                            {formatWalletShort(wallet.wallet)}
                           </span>
                           <span
                             className={`rounded-full border px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide ${syncStatusClass(
@@ -444,6 +726,12 @@ export default function SettingsPage() {
                                 ? "Needs retry"
                                 : "Not synced"}
                           </span>
+                          <span className="text-[11px] text-slate-500">{wallet.syncIntervalMinutes}m interval</span>
+                          {stale && (
+                            <span className="rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-amber-800">
+                              stale
+                            </span>
+                          )}
                           {isEditing && (
                             <button
                               type="button"
@@ -505,24 +793,141 @@ export default function SettingsPage() {
                     {property.wallets.length > 0 && (
                       <div className="mt-4 rounded-lg border border-slate-200 bg-white/80 p-3">
                         <div className="flex items-center justify-between gap-2">
-                          <p className="text-xs font-medium uppercase tracking-wide text-slate-500">Wallet Diagnostics</p>
-                          <p className="text-[11px] text-slate-500">Run reliability checks outside the operator view.</p>
+                          <p className="text-xs font-medium uppercase tracking-wide text-slate-500">Wallet Sync Policy</p>
+                          <p className="text-[11px] text-slate-500">
+                            Configure interval and auto-heal, then validate with reliability checks.
+                          </p>
                         </div>
                         <div className="mt-3 space-y-2">
                           {property.wallets.map((wallet) => {
                             const key = buildWalletReliabilityKey(property.id, wallet.wallet);
                             const reliabilityState = reliabilityByWallet[key];
                             const reliabilityReport = reliabilityState?.report ?? null;
+                            const persistedSyncState = syncStateByWallet.get(wallet.wallet.toLowerCase());
+                            const stale = isWalletStale(persistedSyncState, wallet.syncIntervalMinutes);
+                            const draft = walletPolicyDrafts[key] ?? {
+                              syncEnabled: wallet.syncEnabled,
+                              syncIntervalMinutes: wallet.syncIntervalMinutes,
+                              autoHealEnabled: wallet.autoHealEnabled
+                            };
+                            const isPolicyDirty =
+                              draft.syncEnabled !== wallet.syncEnabled ||
+                              draft.syncIntervalMinutes !== wallet.syncIntervalMinutes ||
+                              draft.autoHealEnabled !== wallet.autoHealEnabled;
+                            const isPolicySaving = walletPolicySavingKey === key;
+
                             return (
                               <div
                                 key={`${wallet.id}-diagnostics`}
-                                className="rounded-lg border border-slate-200 bg-white px-3 py-2"
+                                className="rounded-lg border border-slate-200 bg-white px-3 py-3"
                               >
-                                <div className="flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between">
+                                <div className="flex flex-col gap-2 lg:flex-row lg:items-start lg:justify-between">
                                   <p className="text-sm font-medium text-slate-800">
                                     {wallet.label ? `${wallet.label} · ` : ""}
-                                    {wallet.wallet.slice(0, 10)}...{wallet.wallet.slice(-4)}
+                                    {formatWalletShort(wallet.wallet)}
                                   </p>
+                                  <div className="grid gap-2 sm:grid-cols-[auto_auto_auto_auto]">
+                                    <label className="inline-flex h-9 items-center gap-2 rounded-lg border border-slate-200 px-2.5 text-xs font-medium text-slate-700">
+                                      <input
+                                        type="checkbox"
+                                        checked={draft.syncEnabled}
+                                        onChange={(event) =>
+                                          onUpdateWalletPolicyDraft(property.id, wallet.wallet, {
+                                            syncEnabled: event.target.checked
+                                          })
+                                        }
+                                        className="h-3.5 w-3.5 rounded border-slate-300 text-slate-900"
+                                      />
+                                      Auto-sync
+                                    </label>
+
+                                    <label className="inline-flex h-9 items-center gap-2 rounded-lg border border-slate-200 px-2.5 text-xs font-medium text-slate-700">
+                                      Interval
+                                      <select
+                                        value={draft.syncIntervalMinutes}
+                                        onChange={(event) =>
+                                          onUpdateWalletPolicyDraft(property.id, wallet.wallet, {
+                                            syncIntervalMinutes: Math.max(1, Number(event.target.value))
+                                          })
+                                        }
+                                        className="h-7 rounded border border-slate-200 bg-white px-2 text-xs text-slate-800"
+                                      >
+                                        {SYNC_INTERVAL_OPTIONS.map((minutes) => (
+                                          <option key={minutes} value={minutes}>
+                                            {minutes}m
+                                          </option>
+                                        ))}
+                                      </select>
+                                    </label>
+
+                                    <label className="inline-flex h-9 items-center gap-2 rounded-lg border border-slate-200 px-2.5 text-xs font-medium text-slate-700">
+                                      <input
+                                        type="checkbox"
+                                        checked={draft.autoHealEnabled}
+                                        onChange={(event) =>
+                                          onUpdateWalletPolicyDraft(property.id, wallet.wallet, {
+                                            autoHealEnabled: event.target.checked
+                                          })
+                                        }
+                                        className="h-3.5 w-3.5 rounded border-slate-300 text-slate-900"
+                                      />
+                                      Auto-heal
+                                    </label>
+
+                                    <button
+                                      type="button"
+                                      onClick={() => void onSaveWalletPolicy(property.id, wallet.wallet)}
+                                      disabled={isPolicySaving || !isPolicyDirty}
+                                      className="inline-flex h-9 items-center justify-center rounded-lg border border-slate-300 bg-white px-3 text-xs font-medium text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
+                                    >
+                                      {isPolicySaving ? "Saving..." : isPolicyDirty ? "Save Policy" : "Saved"}
+                                    </button>
+                                  </div>
+                                </div>
+                                <div className="mt-2 flex flex-wrap gap-2 text-xs">
+                                  <span
+                                    className={`rounded-full border px-2.5 py-1 font-medium ${syncStatusClass(
+                                      persistedSyncState?.status
+                                    )}`}
+                                  >
+                                    Sync: {persistedSyncState?.status ?? "idle"}
+                                  </span>
+                                  {stale && (
+                                    <span className="rounded-full border border-amber-200 bg-amber-50 px-2.5 py-1 font-medium text-amber-800">
+                                      stale ({wallet.syncIntervalMinutes * STALE_MULTIPLIER}m+)
+                                    </span>
+                                  )}
+                                  <span
+                                    className={`rounded-full border px-2.5 py-1 font-medium ${
+                                      reliabilityReport
+                                        ? reliabilityReportClass(reliabilityReport)
+                                        : reliabilityStateClass(persistedSyncState?.reliabilityStatus ?? null)
+                                    }`}
+                                  >
+                                    Reliability:{" "}
+                                    {reliabilityReport
+                                      ? reliabilityReportLabel(reliabilityReport)
+                                      : reliabilityStateLabel(persistedSyncState?.reliabilityStatus ?? null)}
+                                  </span>
+                                  <span className="rounded-full border border-slate-200 bg-white px-2.5 py-1 font-medium text-slate-700">
+                                    Last success: {formatRelativeDate(persistedSyncState?.lastSuccessAt ?? null)}
+                                  </span>
+                                  {persistedSyncState?.reliabilityCheckedAt && !reliabilityReport && (
+                                    <span className="rounded-full border border-slate-200 bg-white px-2.5 py-1 font-medium text-slate-700">
+                                      Checked: {formatRelativeDate(persistedSyncState.reliabilityCheckedAt)}
+                                    </span>
+                                  )}
+                                  {persistedSyncState?.reliabilityTradeDelta !== null &&
+                                    persistedSyncState?.reliabilityTradeDelta !== undefined &&
+                                    !reliabilityReport && (
+                                      <span className="rounded-full border border-slate-200 bg-white px-2.5 py-1 font-medium text-slate-700">
+                                        Delta trades:{" "}
+                                        {persistedSyncState.reliabilityTradeDelta >= 0 ? "+" : ""}
+                                        {persistedSyncState.reliabilityTradeDelta}
+                                      </span>
+                                    )}
+                                </div>
+                                <div className="mt-2 flex flex-wrap gap-2 text-xs">
                                   <button
                                     type="button"
                                     onClick={() => void onRunReliabilityCheck(property.id, wallet.wallet)}
@@ -538,15 +943,6 @@ export default function SettingsPage() {
                                       "Run Reliability Check"
                                     )}
                                   </button>
-                                </div>
-                                <div className="mt-2 flex flex-wrap gap-2 text-xs">
-                                  <span
-                                    className={`rounded-full border px-2.5 py-1 font-medium ${reliabilityStatusClass(
-                                      reliabilityReport
-                                    )}`}
-                                  >
-                                    Reliability: {reliabilityStatusLabel(reliabilityReport)}
-                                  </span>
                                   {reliabilityReport && (
                                     <>
                                       <span className="rounded-full border border-slate-200 bg-white px-2.5 py-1 font-medium text-slate-700">
