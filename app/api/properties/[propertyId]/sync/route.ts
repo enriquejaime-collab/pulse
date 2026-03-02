@@ -13,7 +13,6 @@ import {
 } from "@/src/lib/polymarket/summary";
 
 const WALLET_ADDRESS_PATTERN = /^0x[a-fA-F0-9]{40}$/;
-const INCREMENTAL_OVERLAP_HOURS = 24;
 const RECENT_RUNS_LIMIT = 10;
 
 const countRecordsIngested = (summary: PolymarketSummary): number => {
@@ -277,9 +276,7 @@ export async function POST(request: Request, context: { params: Promise<{ proper
     });
 
     const fetchedDataSets = await fetchPolymarketSummaryDataSets(wallet, {
-      mode,
-      lastSuccessAt: existingSyncState?.lastSuccessAt ?? null,
-      overlapHours: INCREMENTAL_OVERLAP_HOURS
+      mode
     });
 
     if (mode === "full") {

@@ -955,8 +955,6 @@ export interface PolymarketSummaryDataSets {
 
 export interface PolymarketFetchModeOptions {
   mode?: "full" | "incremental";
-  lastSuccessAt?: string | null;
-  overlapHours?: number;
 }
 
 export const fetchPolymarketSummaryDataSets = async (
@@ -964,8 +962,7 @@ export const fetchPolymarketSummaryDataSets = async (
   options: PolymarketFetchModeOptions = {}
 ): Promise<PolymarketSummaryDataSets> => {
   const mode = options.mode ?? "full";
-  void options.overlapHours;
-  void options.lastSuccessAt;
+  // Incremental mode intentionally caps depth to keep sync fast. Full mode walks all pages.
   const maxPages = mode === "incremental" ? 200 : Number.POSITIVE_INFINITY;
 
   const [trades, closedPositions, openPositions, activity] = await Promise.all([

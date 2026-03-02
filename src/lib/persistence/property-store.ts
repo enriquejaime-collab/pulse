@@ -427,19 +427,33 @@ class SupabasePropertyStore implements PropertyStore {
     lastError?: string | null;
     recordsIngested?: number;
   }): Promise<StoredWalletSyncState> {
+    const payload: Record<string, unknown> = {
+      property_id: input.propertyId,
+      wallet: ensureWallet(input.wallet),
+      status: input.status
+    };
+    if (Object.prototype.hasOwnProperty.call(input, "lastRunId")) {
+      payload.last_run_id = input.lastRunId ?? null;
+    }
+    if (Object.prototype.hasOwnProperty.call(input, "consecutiveFailures")) {
+      payload.consecutive_failures = input.consecutiveFailures ?? 0;
+    }
+    if (Object.prototype.hasOwnProperty.call(input, "lastSyncAt")) {
+      payload.last_sync_at = input.lastSyncAt ?? null;
+    }
+    if (Object.prototype.hasOwnProperty.call(input, "lastSuccessAt")) {
+      payload.last_success_at = input.lastSuccessAt ?? null;
+    }
+    if (Object.prototype.hasOwnProperty.call(input, "lastError")) {
+      payload.last_error = input.lastError ?? null;
+    }
+    if (Object.prototype.hasOwnProperty.call(input, "recordsIngested")) {
+      payload.records_ingested = input.recordsIngested ?? 0;
+    }
+
     const rows = await this.client.post<Record<string, unknown>[]>(
       "/wallet_sync_state?on_conflict=property_id,wallet",
-      {
-        property_id: input.propertyId,
-        wallet: ensureWallet(input.wallet),
-        status: input.status,
-        last_run_id: input.lastRunId ?? null,
-        consecutive_failures: input.consecutiveFailures ?? 0,
-        last_sync_at: input.lastSyncAt ?? null,
-        last_success_at: input.lastSuccessAt ?? null,
-        last_error: input.lastError ?? null,
-        records_ingested: input.recordsIngested ?? 0
-      },
+      payload,
       { Prefer: "resolution=merge-duplicates,return=representation" }
     );
     return mapSyncStateRow(rows[0] ?? {});
@@ -883,13 +897,21 @@ class LocalFilePropertyStore implements PropertyStore {
       if (Object.prototype.hasOwnProperty.call(input, "lastRunId")) {
         existing.lastRunId = input.lastRunId ?? null;
       }
-      if (typeof input.consecutiveFailures === "number") {
-        existing.consecutiveFailures = input.consecutiveFailures;
+      if (Object.prototype.hasOwnProperty.call(input, "consecutiveFailures")) {
+        existing.consecutiveFailures = input.consecutiveFailures ?? 0;
       }
-      existing.lastSyncAt = input.lastSyncAt ?? existing.lastSyncAt;
-      existing.lastSuccessAt = input.lastSuccessAt ?? existing.lastSuccessAt;
-      existing.lastError = input.lastError ?? null;
-      existing.recordsIngested = input.recordsIngested ?? existing.recordsIngested;
+      if (Object.prototype.hasOwnProperty.call(input, "lastSyncAt")) {
+        existing.lastSyncAt = input.lastSyncAt ?? null;
+      }
+      if (Object.prototype.hasOwnProperty.call(input, "lastSuccessAt")) {
+        existing.lastSuccessAt = input.lastSuccessAt ?? null;
+      }
+      if (Object.prototype.hasOwnProperty.call(input, "lastError")) {
+        existing.lastError = input.lastError ?? null;
+      }
+      if (Object.prototype.hasOwnProperty.call(input, "recordsIngested")) {
+        existing.recordsIngested = input.recordsIngested ?? 0;
+      }
       existing.updatedAt = now;
       await this.writeStore(doc);
       return existing;
