@@ -36,6 +36,28 @@ interface WalletSyncStateModel {
   updatedAt: string;
 }
 
+interface ReliabilityReport {
+  pass: boolean;
+  status?: "pass" | "pass_with_trade_drift" | "mismatch";
+  strictPass?: boolean;
+  tolerance?: {
+    tradeDeltaSoft?: number;
+  };
+  checkedAt: string;
+  deltas: {
+    trades: number;
+    closedPositions: number;
+    wins: number;
+    losses: number;
+  };
+}
+
+interface WalletReliabilityState {
+  isLoading: boolean;
+  report: ReliabilityReport | null;
+  error: string | null;
+}
+
 const WALLET_PATTERN = /^0x[a-f0-9]{40}$/i;
 
 const formatRelativeDate = (value: string | null): string => {
@@ -67,9 +89,41 @@ const syncStatusClass = (status: WalletSyncStateModel["status"] | undefined): st
   return "border-slate-200 bg-white text-slate-600";
 };
 
+const reliabilityStatusClass = (report: ReliabilityReport | null): string => {
+  if (!report) {
+    return "border-slate-200 bg-white text-slate-600";
+  }
+  if (report.status === "mismatch") {
+    return "border-amber-200 bg-amber-50 text-amber-800";
+  }
+  if (report.status === "pass_with_trade_drift") {
+    return "border-blue-200 bg-blue-50 text-blue-700";
+  }
+  if (report.pass) {
+    return "border-emerald-200 bg-emerald-50 text-emerald-700";
+  }
+  return "border-slate-200 bg-white text-slate-600";
+};
+
+const reliabilityStatusLabel = (report: ReliabilityReport | null): string => {
+  if (!report) {
+    return "Not checked";
+  }
+  if (report.status === "pass_with_trade_drift") {
+    return "Pass (trade drift)";
+  }
+  if (report.status === "mismatch") {
+    return "Mismatch";
+  }
+  return report.pass ? "Pass" : "Unknown";
+};
+
+const buildWalletReliabilityKey = (propertyId: string, wallet: string): string => `${propertyId}:${wallet.toLowerCase()}`;
+
 export default function SettingsPage() {
   const [properties, setProperties] = useState<PropertyModel[]>([]);
   const [syncStatesByProperty, setSyncStatesByProperty] = useState<Record<string, WalletSyncStateModel[]>>({});
+  const [reliabilityByWallet, setReliabilityByWallet] = useState<Record<string, WalletReliabilityState>>({});
   const [backend, setBackend] = useState<"supabase" | "local" | "unknown">("unknown");
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -269,6 +323,50 @@ export default function SettingsPage() {
     }
   };
 
+  const onRunReliabilityCheck = async (propertyId: string, wallet: string) => {
+    const key = buildWalletReliabilityKey(propertyId, wallet);
+    setReliabilityByWallet((previous) => ({
+      ...previous,
+      [key]: {
+        isLoading: true,
+        report: previous[key]?.report ?? null,
+        error: null
+      }
+    }));
+
+    try {
+      const response = await fetch(`/api/properties/${encodeURIComponent(propertyId)}/reliability`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ wallet })
+      });
+      const payload = (await response.json()) as ReliabilityReport & { error?: string };
+
+      if (!response.ok) {
+        throw new Error(payload.error ?? "Reliability check failed.");
+      }
+
+      setReliabilityByWallet((previous) => ({
+        ...previous,
+        [key]: {
+          isLoading: false,
+          report: payload,
+          error: null
+        }
+      }));
+    } catch (checkError) {
+      const message = checkError instanceof Error ? checkError.message : "Reliability check failed.";
+      setReliabilityByWallet((previous) => ({
+        ...previous,
+        [key]: {
+          isLoading: false,
+          report: previous[key]?.report ?? null,
+          error: message
+        }
+      }));
+    }
+  };
+
   return (
     <PageShell
       title="Settings"
@@ -362,46 +460,131 @@ export default function SettingsPage() {
                 )}
 
                 {isEditing && (
-                  <div className="mt-4 grid gap-4 lg:grid-cols-2">
-                    <form onSubmit={onSavePropertyName} className="rounded-lg border border-slate-200 bg-white/80 p-3">
-                      <label className="text-xs font-medium uppercase tracking-wide text-slate-500">Property Name</label>
-                      <input
-                        value={editingName}
-                        onChange={(event) => setEditingName(event.target.value)}
-                        className="mt-1.5 h-11 w-full rounded-lg border border-slate-300 bg-white px-3 text-sm text-slate-800"
-                      />
-                      <button
-                        type="submit"
-                        disabled={isSubmitting}
-                        className="mt-3 inline-flex h-10 items-center justify-center rounded-lg border border-slate-300 bg-white px-3 text-sm font-medium text-slate-700 transition hover:bg-slate-50 disabled:opacity-60"
-                      >
-                        Save Name
-                      </button>
-                    </form>
+                  <>
+                    <div className="mt-4 grid gap-4 lg:grid-cols-2">
+                      <form onSubmit={onSavePropertyName} className="rounded-lg border border-slate-200 bg-white/80 p-3">
+                        <label className="text-xs font-medium uppercase tracking-wide text-slate-500">Property Name</label>
+                        <input
+                          value={editingName}
+                          onChange={(event) => setEditingName(event.target.value)}
+                          className="mt-1.5 h-11 w-full rounded-lg border border-slate-300 bg-white px-3 text-sm text-slate-800"
+                        />
+                        <button
+                          type="submit"
+                          disabled={isSubmitting}
+                          className="mt-3 inline-flex h-10 items-center justify-center rounded-lg border border-slate-300 bg-white px-3 text-sm font-medium text-slate-700 transition hover:bg-slate-50 disabled:opacity-60"
+                        >
+                          Save Name
+                        </button>
+                      </form>
 
-                    <form onSubmit={onAddWallet} className="rounded-lg border border-slate-200 bg-white/80 p-3">
-                      <label className="text-xs font-medium uppercase tracking-wide text-slate-500">Add Wallet</label>
-                      <input
-                        placeholder="0x..."
-                        value={walletInput}
-                        onChange={(event) => setWalletInput(event.target.value)}
-                        className="mt-1.5 h-11 w-full rounded-lg border border-slate-300 bg-white px-3 text-sm text-slate-800"
-                      />
-                      <input
-                        placeholder="Alias (optional)"
-                        value={walletAliasInput}
-                        onChange={(event) => setWalletAliasInput(event.target.value)}
-                        className="mt-2 h-11 w-full rounded-lg border border-slate-300 bg-white px-3 text-sm text-slate-800"
-                      />
-                      <button
-                        type="submit"
-                        disabled={isSubmitting}
-                        className="mt-3 inline-flex h-10 items-center justify-center rounded-lg border border-slate-300 bg-white px-3 text-sm font-medium text-slate-700 transition hover:bg-slate-50 disabled:opacity-60"
-                      >
-                        Save Wallet
-                      </button>
-                    </form>
-                  </div>
+                      <form onSubmit={onAddWallet} className="rounded-lg border border-slate-200 bg-white/80 p-3">
+                        <label className="text-xs font-medium uppercase tracking-wide text-slate-500">Add Wallet</label>
+                        <input
+                          placeholder="0x..."
+                          value={walletInput}
+                          onChange={(event) => setWalletInput(event.target.value)}
+                          className="mt-1.5 h-11 w-full rounded-lg border border-slate-300 bg-white px-3 text-sm text-slate-800"
+                        />
+                        <input
+                          placeholder="Alias (optional)"
+                          value={walletAliasInput}
+                          onChange={(event) => setWalletAliasInput(event.target.value)}
+                          className="mt-2 h-11 w-full rounded-lg border border-slate-300 bg-white px-3 text-sm text-slate-800"
+                        />
+                        <button
+                          type="submit"
+                          disabled={isSubmitting}
+                          className="mt-3 inline-flex h-10 items-center justify-center rounded-lg border border-slate-300 bg-white px-3 text-sm font-medium text-slate-700 transition hover:bg-slate-50 disabled:opacity-60"
+                        >
+                          Save Wallet
+                        </button>
+                      </form>
+                    </div>
+
+                    {property.wallets.length > 0 && (
+                      <div className="mt-4 rounded-lg border border-slate-200 bg-white/80 p-3">
+                        <div className="flex items-center justify-between gap-2">
+                          <p className="text-xs font-medium uppercase tracking-wide text-slate-500">Wallet Diagnostics</p>
+                          <p className="text-[11px] text-slate-500">Run reliability checks outside the operator view.</p>
+                        </div>
+                        <div className="mt-3 space-y-2">
+                          {property.wallets.map((wallet) => {
+                            const key = buildWalletReliabilityKey(property.id, wallet.wallet);
+                            const reliabilityState = reliabilityByWallet[key];
+                            const reliabilityReport = reliabilityState?.report ?? null;
+                            return (
+                              <div
+                                key={`${wallet.id}-diagnostics`}
+                                className="rounded-lg border border-slate-200 bg-white px-3 py-2"
+                              >
+                                <div className="flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between">
+                                  <p className="text-sm font-medium text-slate-800">
+                                    {wallet.label ? `${wallet.label} · ` : ""}
+                                    {wallet.wallet.slice(0, 10)}...{wallet.wallet.slice(-4)}
+                                  </p>
+                                  <button
+                                    type="button"
+                                    onClick={() => void onRunReliabilityCheck(property.id, wallet.wallet)}
+                                    disabled={reliabilityState?.isLoading}
+                                    className="inline-flex h-9 items-center justify-center rounded-lg border border-slate-300 bg-white px-3 text-xs font-medium text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
+                                  >
+                                    {reliabilityState?.isLoading ? (
+                                      <span className="inline-flex items-center gap-2">
+                                        <span className="h-3 w-3 animate-spin rounded-full border-2 border-slate-300 border-t-slate-700" />
+                                        Checking
+                                      </span>
+                                    ) : (
+                                      "Run Reliability Check"
+                                    )}
+                                  </button>
+                                </div>
+                                <div className="mt-2 flex flex-wrap gap-2 text-xs">
+                                  <span
+                                    className={`rounded-full border px-2.5 py-1 font-medium ${reliabilityStatusClass(
+                                      reliabilityReport
+                                    )}`}
+                                  >
+                                    Reliability: {reliabilityStatusLabel(reliabilityReport)}
+                                  </span>
+                                  {reliabilityReport && (
+                                    <>
+                                      <span className="rounded-full border border-slate-200 bg-white px-2.5 py-1 font-medium text-slate-700">
+                                        Delta trades: {reliabilityReport.deltas.trades >= 0 ? "+" : ""}
+                                        {reliabilityReport.deltas.trades}
+                                      </span>
+                                      <span className="rounded-full border border-slate-200 bg-white px-2.5 py-1 font-medium text-slate-700">
+                                        Delta closed: {reliabilityReport.deltas.closedPositions >= 0 ? "+" : ""}
+                                        {reliabilityReport.deltas.closedPositions}
+                                      </span>
+                                      <span className="rounded-full border border-slate-200 bg-white px-2.5 py-1 font-medium text-slate-700">
+                                        Delta W/L: {reliabilityReport.deltas.wins >= 0 ? "+" : ""}
+                                        {reliabilityReport.deltas.wins}/{reliabilityReport.deltas.losses >= 0 ? "+" : ""}
+                                        {reliabilityReport.deltas.losses}
+                                      </span>
+                                      <span className="rounded-full border border-slate-200 bg-white px-2.5 py-1 font-medium text-slate-700">
+                                        Checked: {formatRelativeDate(reliabilityReport.checkedAt)}
+                                      </span>
+                                      {reliabilityReport.status === "pass_with_trade_drift" && (
+                                        <span className="rounded-full border border-blue-200 bg-blue-50 px-2.5 py-1 font-medium text-blue-700">
+                                          tolerance ±{reliabilityReport.tolerance?.tradeDeltaSoft ?? 10} trades
+                                        </span>
+                                      )}
+                                    </>
+                                  )}
+                                </div>
+                                {reliabilityState?.error && (
+                                  <p className="mt-2 text-xs font-medium text-red-700">
+                                    Reliability check error: {reliabilityState.error}
+                                  </p>
+                                )}
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    )}
+                  </>
                 )}
               </article>
             );

@@ -105,6 +105,23 @@ export interface PolymarketSummary {
   };
 }
 
+export const getTradeCanonicalKey = (trade: PolymarketTrade): string => {
+  const outcomeToken = String(trade.asset ?? trade.outcome ?? trade.outcomeIndex ?? "");
+  const marketToken = String(trade.conditionId ?? trade.marketId ?? trade.market ?? trade.slug ?? "");
+  return [
+    String(trade.id ?? ""),
+    String(trade.transactionHash ?? ""),
+    String(trade.timestamp ?? ""),
+    outcomeToken,
+    String(trade.side ?? ""),
+    String(trade.size ?? ""),
+    String(trade.price ?? ""),
+    marketToken
+  ]
+    .map((part) => part.trim().toLowerCase())
+    .join("|");
+};
+
 interface NormalizedTrade {
   id: string;
   side: "BUY" | "SELL" | "OTHER";
@@ -947,12 +964,8 @@ export const fetchPolymarketSummaryDataSets = async (
   options: PolymarketFetchModeOptions = {}
 ): Promise<PolymarketSummaryDataSets> => {
   const mode = options.mode ?? "full";
-  const overlapHours = options.overlapHours ?? 24;
-  const lastSuccessMs = options.lastSuccessAt ? Date.parse(options.lastSuccessAt) : Number.NaN;
-  const stopWhenOlderThanMs =
-    mode === "incremental" && Number.isFinite(lastSuccessMs)
-      ? (lastSuccessMs as number) - overlapHours * 60 * 60 * 1000
-      : undefined;
+  void options.overlapHours;
+  void options.lastSuccessAt;
   const maxPages = mode === "incremental" ? 200 : Number.POSITIVE_INFINITY;
 
   const [trades, closedPositions, openPositions, activity] = await Promise.all([
@@ -962,36 +975,12 @@ export const fetchPolymarketSummaryDataSets = async (
       maxPages,
       nonFatalStatuses: [400],
       queryParams: { takerOnly: false },
-      stopWhenAllRowsOlderThanMs: stopWhenOlderThanMs,
-      getRowTimestampMs: (row) => tryParseTimestampMs((row as PolymarketTrade).timestamp),
-      dedupeKey: (row) => {
-        const trade = row as PolymarketTrade;
-        return (
-          trade.id ??
-          `${trade.transactionHash ?? "tx"}:${trade.timestamp ?? "ts"}:${trade.asset ?? "asset"}:${
-            trade.side ?? "side"
-          }:${trade.size ?? "size"}:${trade.price ?? "price"}`
-        );
-      }
+      dedupeKey: (row) => getTradeCanonicalKey(row as PolymarketTrade)
     }),
     fetchPaginated<PolymarketPosition>("/closed-positions", wallet, {
       pageSize: 50,
       maxOffset: 100_000,
-      maxPages,
-      stopWhenAllRowsOlderThanMs: stopWhenOlderThanMs,
-      getRowTimestampMs: (row) => {
-        const asRecord = row as Record<string, unknown>;
-        return (
-          tryParseTimestampMs(
-            asRecord.timestamp ??
-              asRecord.closedAt ??
-              asRecord.closed_at ??
-              asRecord.updatedAt ??
-              asRecord.updated_at ??
-              asRecord.endDate
-          ) ?? null
-        );
-      }
+      maxPages
     }),
     // Open positions are relatively small and represent current state, so always fetch full set.
     fetchPaginated<PolymarketPosition>("/positions", wallet, { pageSize: 50, maxOffset: 100_000 }),
@@ -999,8 +988,6 @@ export const fetchPolymarketSummaryDataSets = async (
       pageSize: 50,
       maxOffset: 100_000,
       maxPages,
-      stopWhenAllRowsOlderThanMs: stopWhenOlderThanMs,
-      getRowTimestampMs: (row) => tryParseTimestampMs((row as PolymarketActivity).timestamp),
       nonFatalStatuses: [400, 404]
     })
   ]);

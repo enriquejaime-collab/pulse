@@ -5,6 +5,7 @@ import type { RawRecordInput, StoredRawDataSets, SyncRunMode } from "@/src/lib/p
 import {
   buildPolymarketSummaryFromDataSets,
   fetchPolymarketSummaryDataSets,
+  getTradeCanonicalKey,
   type PolymarketActivity,
   type PolymarketPosition,
   type PolymarketSummary,
@@ -71,6 +72,25 @@ const stableJsonStringify = (value: unknown): string => {
 const payloadHash = (row: Record<string, unknown>): string =>
   createHash("sha1").update(stableJsonStringify(row)).digest("hex");
 
+const hashKeyParts = (prefix: string, parts: unknown[]): string => {
+  const normalized = parts
+    .map((part) => {
+      if (part === null || part === undefined) {
+        return "";
+      }
+      if (typeof part === "string") {
+        return part.trim();
+      }
+      if (typeof part === "number" || typeof part === "boolean") {
+        return String(part);
+      }
+      return stableJsonStringify(part);
+    })
+    .join("|");
+
+  return `${prefix}:${createHash("sha1").update(normalized).digest("hex")}`;
+};
+
 const stableRecordId = (
   prefix: string,
   row: Record<string, unknown>,
@@ -113,7 +133,8 @@ const buildRawRecordInput = (dataSets: Awaited<ReturnType<typeof fetchPolymarket
     const row = trade as Record<string, unknown>;
     records.push({
       endpoint: "trades",
-      recordId: firstStringFromKeys(row, ["id"]) || `trade:hash:${payloadHash(row)}`,
+      // Must match the live fetch dedupe key exactly for reliable parity checks.
+      recordId: `trade:${getTradeCanonicalKey(trade)}`,
       timestamp: toIsoTimestamp(trade.timestamp),
       payload: row
     });
@@ -150,9 +171,20 @@ const buildRawRecordInput = (dataSets: Awaited<ReturnType<typeof fetchPolymarket
     const row = activity as Record<string, unknown>;
     records.push({
       endpoint: "activity",
-      recordId:
-        firstStringFromKeys(row, ["id", "activityId", "activity_id", "hash", "txHash", "transactionHash"]) ||
-        `activity:hash:${payloadHash(row)}`,
+      recordId: hashKeyParts("activity", [
+        row.id,
+        row.activityId,
+        row.activity_id,
+        row.hash,
+        row.txHash,
+        row.transactionHash,
+        row.type,
+        row.timestamp,
+        row.asset,
+        row.outcome,
+        row.market,
+        row.conditionId
+      ]),
       timestamp: toIsoTimestamp((activity as PolymarketActivity).timestamp ?? row.createdAt ?? row.created_at),
       payload: row
     });
