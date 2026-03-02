@@ -41,6 +41,9 @@ const mapWalletRow = (row: Record<string, unknown>): StoredWallet => ({
   wallet: String(row.wallet ?? "").toLowerCase(),
   label: typeof row.label === "string" ? row.label : null,
   strategyTag: typeof row.strategy_tag === "string" ? row.strategy_tag : null,
+  syncEnabled: Boolean(row.sync_enabled ?? true),
+  syncIntervalMinutes: Math.max(1, Number(row.sync_interval_minutes ?? 15)),
+  autoHealEnabled: Boolean(row.auto_heal_enabled ?? true),
   createdAt: toIsoString(row.created_at),
   updatedAt: toIsoString(row.updated_at)
 });
@@ -66,6 +69,19 @@ const mapSyncStateRow = (row: Record<string, unknown>): StoredWalletSyncState =>
   lastSuccessAt: typeof row.last_success_at === "string" ? row.last_success_at : null,
   lastError: typeof row.last_error === "string" ? row.last_error : null,
   recordsIngested: Number(row.records_ingested ?? 0),
+  reliabilityStatus:
+    row.reliability_status === "pass" ||
+    row.reliability_status === "pass_with_trade_drift" ||
+    row.reliability_status === "mismatch"
+      ? (row.reliability_status as "pass" | "pass_with_trade_drift" | "mismatch")
+      : null,
+  reliabilityCheckedAt: typeof row.reliability_checked_at === "string" ? row.reliability_checked_at : null,
+  reliabilityTradeDelta:
+    typeof row.reliability_trade_delta === "number"
+      ? row.reliability_trade_delta
+      : typeof row.reliability_trade_delta === "string"
+        ? Number(row.reliability_trade_delta)
+        : null,
   updatedAt: toIsoString(row.updated_at)
 });
 
@@ -174,7 +190,7 @@ class SupabasePropertyStore implements PropertyStore {
 
     const ids = properties.map((property) => property.id);
     const walletsRaw = await this.client.get<Record<string, unknown>[]>(
-      `/property_wallets?select=id,property_id,wallet,label,strategy_tag,created_at,updated_at&property_id=in.(${ids.join(",")})&order=created_at.asc`
+      `/property_wallets?select=id,property_id,wallet,label,strategy_tag,sync_enabled,sync_interval_minutes,auto_heal_enabled,created_at,updated_at&property_id=in.(${ids.join(",")})&order=created_at.asc`
     );
     const wallets = walletsRaw.map(mapWalletRow);
 
@@ -207,6 +223,9 @@ class SupabasePropertyStore implements PropertyStore {
       patch,
       { Prefer: "return=representation" }
     );
+    if (rows.length === 0) {
+      throw new Error("Property not found.");
+    }
     return mapPropertyRow(rows[0] ?? {});
   }
 
@@ -215,6 +234,9 @@ class SupabasePropertyStore implements PropertyStore {
     wallet: string;
     label?: string | null;
     strategyTag?: string | null;
+    syncEnabled?: boolean;
+    syncIntervalMinutes?: number;
+    autoHealEnabled?: boolean;
   }): Promise<StoredWallet> {
     const rows = await this.client.post<Record<string, unknown>[]>(
       "/property_wallets?on_conflict=property_id,wallet",
@@ -222,10 +244,51 @@ class SupabasePropertyStore implements PropertyStore {
         property_id: input.propertyId,
         wallet: ensureWallet(input.wallet),
         label: input.label ?? null,
-        strategy_tag: input.strategyTag ?? null
+        strategy_tag: input.strategyTag ?? null,
+        sync_enabled: input.syncEnabled ?? true,
+        sync_interval_minutes: Math.max(1, Number(input.syncIntervalMinutes ?? 15)),
+        auto_heal_enabled: input.autoHealEnabled ?? true
       },
       { Prefer: "resolution=merge-duplicates,return=representation" }
     );
+    return mapWalletRow(rows[0] ?? {});
+  }
+
+  async updateWallet(input: {
+    propertyId: string;
+    wallet: string;
+    label?: string | null;
+    strategyTag?: string | null;
+    syncEnabled?: boolean;
+    syncIntervalMinutes?: number;
+    autoHealEnabled?: boolean;
+  }): Promise<StoredWallet> {
+    const normalized = ensureWallet(input.wallet);
+    const patch: Record<string, unknown> = {};
+    if (Object.prototype.hasOwnProperty.call(input, "label")) {
+      patch.label = input.label ?? null;
+    }
+    if (Object.prototype.hasOwnProperty.call(input, "strategyTag")) {
+      patch.strategy_tag = input.strategyTag ?? null;
+    }
+    if (Object.prototype.hasOwnProperty.call(input, "syncEnabled")) {
+      patch.sync_enabled = Boolean(input.syncEnabled);
+    }
+    if (Object.prototype.hasOwnProperty.call(input, "syncIntervalMinutes")) {
+      patch.sync_interval_minutes = Math.max(1, Number(input.syncIntervalMinutes ?? 15));
+    }
+    if (Object.prototype.hasOwnProperty.call(input, "autoHealEnabled")) {
+      patch.auto_heal_enabled = Boolean(input.autoHealEnabled);
+    }
+
+    const rows = await this.client.patch<Record<string, unknown>[]>(
+      `/property_wallets?property_id=eq.${input.propertyId}&wallet=eq.${normalized}`,
+      patch,
+      { Prefer: "return=representation" }
+    );
+    if (rows.length === 0) {
+      throw new Error("Wallet not found.");
+    }
     return mapWalletRow(rows[0] ?? {});
   }
 
@@ -317,7 +380,7 @@ class SupabasePropertyStore implements PropertyStore {
 
   async listSyncStates(propertyId: string): Promise<StoredWalletSyncState[]> {
     const rows = await this.client.get<Record<string, unknown>[]>(
-      `/wallet_sync_state?select=id,property_id,wallet,status,last_run_id,consecutive_failures,last_sync_at,last_success_at,last_error,records_ingested,updated_at&property_id=eq.${propertyId}&order=updated_at.desc`
+      `/wallet_sync_state?select=id,property_id,wallet,status,last_run_id,consecutive_failures,last_sync_at,last_success_at,last_error,records_ingested,reliability_status,reliability_checked_at,reliability_trade_delta,updated_at&property_id=eq.${propertyId}&order=updated_at.desc`
     );
     return rows.map(mapSyncStateRow);
   }
@@ -426,6 +489,9 @@ class SupabasePropertyStore implements PropertyStore {
     lastSuccessAt?: string | null;
     lastError?: string | null;
     recordsIngested?: number;
+    reliabilityStatus?: "pass" | "pass_with_trade_drift" | "mismatch" | null;
+    reliabilityCheckedAt?: string | null;
+    reliabilityTradeDelta?: number | null;
   }): Promise<StoredWalletSyncState> {
     const payload: Record<string, unknown> = {
       property_id: input.propertyId,
@@ -450,6 +516,15 @@ class SupabasePropertyStore implements PropertyStore {
     if (Object.prototype.hasOwnProperty.call(input, "recordsIngested")) {
       payload.records_ingested = input.recordsIngested ?? 0;
     }
+    if (Object.prototype.hasOwnProperty.call(input, "reliabilityStatus")) {
+      payload.reliability_status = input.reliabilityStatus ?? null;
+    }
+    if (Object.prototype.hasOwnProperty.call(input, "reliabilityCheckedAt")) {
+      payload.reliability_checked_at = input.reliabilityCheckedAt ?? null;
+    }
+    if (Object.prototype.hasOwnProperty.call(input, "reliabilityTradeDelta")) {
+      payload.reliability_trade_delta = input.reliabilityTradeDelta ?? null;
+    }
 
     const rows = await this.client.post<Record<string, unknown>[]>(
       "/wallet_sync_state?on_conflict=property_id,wallet",
@@ -462,7 +537,7 @@ class SupabasePropertyStore implements PropertyStore {
   async getSyncState(propertyId: string, wallet: string): Promise<StoredWalletSyncState | null> {
     const normalized = ensureWallet(wallet);
     const rows = await this.client.get<Record<string, unknown>[]>(
-      `/wallet_sync_state?select=id,property_id,wallet,status,last_run_id,consecutive_failures,last_sync_at,last_success_at,last_error,records_ingested,updated_at&property_id=eq.${propertyId}&wallet=eq.${normalized}&limit=1`
+      `/wallet_sync_state?select=id,property_id,wallet,status,last_run_id,consecutive_failures,last_sync_at,last_success_at,last_error,records_ingested,reliability_status,reliability_checked_at,reliability_trade_delta,updated_at&property_id=eq.${propertyId}&wallet=eq.${normalized}&limit=1`
     );
     if (rows.length === 0) {
       return null;
@@ -485,6 +560,9 @@ interface LocalStoreDocument {
     wallet: string;
     label: string | null;
     strategyTag: string | null;
+    syncEnabled: boolean;
+    syncIntervalMinutes: number;
+    autoHealEnabled: boolean;
     createdAt: string;
     updatedAt: string;
   }>;
@@ -508,6 +586,9 @@ interface LocalStoreDocument {
     lastSuccessAt: string | null;
     lastError: string | null;
     recordsIngested: number;
+    reliabilityStatus: "pass" | "pass_with_trade_drift" | "mismatch" | null;
+    reliabilityCheckedAt: string | null;
+    reliabilityTradeDelta: number | null;
     updatedAt: string;
   }>;
   syncRuns: Array<{
@@ -576,7 +657,18 @@ class LocalFilePropertyStore implements PropertyStore {
       const parsed = JSON.parse(raw) as Partial<LocalStoreDocument>;
       return {
         properties: parsed.properties ?? [],
-        wallets: parsed.wallets ?? [],
+        wallets: (parsed.wallets ?? []).map((wallet) => ({
+          id: String(wallet.id ?? randomUUID()),
+          propertyId: String(wallet.propertyId ?? ""),
+          wallet: ensureWallet(String(wallet.wallet ?? "")),
+          label: typeof wallet.label === "string" ? wallet.label : null,
+          strategyTag: typeof wallet.strategyTag === "string" ? wallet.strategyTag : null,
+          syncEnabled: Boolean(wallet.syncEnabled ?? true),
+          syncIntervalMinutes: Math.max(1, Number(wallet.syncIntervalMinutes ?? 15)),
+          autoHealEnabled: Boolean(wallet.autoHealEnabled ?? true),
+          createdAt: toIsoString(wallet.createdAt),
+          updatedAt: toIsoString(wallet.updatedAt)
+        })),
         snapshots: parsed.snapshots ?? [],
         syncStates: (parsed.syncStates ?? []).map((state) => ({
           id: String(state.id ?? randomUUID()),
@@ -589,6 +681,19 @@ class LocalFilePropertyStore implements PropertyStore {
           lastSuccessAt: typeof state.lastSuccessAt === "string" ? state.lastSuccessAt : null,
           lastError: typeof state.lastError === "string" ? state.lastError : null,
           recordsIngested: Number(state.recordsIngested ?? 0),
+          reliabilityStatus:
+            state.reliabilityStatus === "pass" ||
+            state.reliabilityStatus === "pass_with_trade_drift" ||
+            state.reliabilityStatus === "mismatch"
+              ? state.reliabilityStatus
+              : null,
+          reliabilityCheckedAt: typeof state.reliabilityCheckedAt === "string" ? state.reliabilityCheckedAt : null,
+          reliabilityTradeDelta:
+            typeof state.reliabilityTradeDelta === "number"
+              ? state.reliabilityTradeDelta
+              : typeof state.reliabilityTradeDelta === "string"
+                ? Number(state.reliabilityTradeDelta)
+                : null,
           updatedAt: toIsoString(state.updatedAt)
         })),
         syncRuns: (parsed.syncRuns ?? []).map((run) => ({
@@ -664,6 +769,9 @@ class LocalFilePropertyStore implements PropertyStore {
     wallet: string;
     label?: string | null;
     strategyTag?: string | null;
+    syncEnabled?: boolean;
+    syncIntervalMinutes?: number;
+    autoHealEnabled?: boolean;
   }): Promise<StoredWallet> {
     const doc = await this.readStore();
     const normalizedWallet = ensureWallet(input.wallet);
@@ -675,6 +783,15 @@ class LocalFilePropertyStore implements PropertyStore {
     if (existing) {
       existing.label = input.label ?? existing.label ?? null;
       existing.strategyTag = input.strategyTag ?? existing.strategyTag ?? null;
+      if (Object.prototype.hasOwnProperty.call(input, "syncEnabled")) {
+        existing.syncEnabled = Boolean(input.syncEnabled);
+      }
+      if (Object.prototype.hasOwnProperty.call(input, "syncIntervalMinutes")) {
+        existing.syncIntervalMinutes = Math.max(1, Number(input.syncIntervalMinutes ?? existing.syncIntervalMinutes));
+      }
+      if (Object.prototype.hasOwnProperty.call(input, "autoHealEnabled")) {
+        existing.autoHealEnabled = Boolean(input.autoHealEnabled);
+      }
       existing.updatedAt = now;
       await this.writeStore(doc);
       return existing;
@@ -686,12 +803,53 @@ class LocalFilePropertyStore implements PropertyStore {
       wallet: normalizedWallet,
       label: input.label ?? null,
       strategyTag: input.strategyTag ?? null,
+      syncEnabled: input.syncEnabled ?? true,
+      syncIntervalMinutes: Math.max(1, Number(input.syncIntervalMinutes ?? 15)),
+      autoHealEnabled: input.autoHealEnabled ?? true,
       createdAt: now,
       updatedAt: now
     };
     doc.wallets.push(wallet);
     await this.writeStore(doc);
     return wallet;
+  }
+
+  async updateWallet(input: {
+    propertyId: string;
+    wallet: string;
+    label?: string | null;
+    strategyTag?: string | null;
+    syncEnabled?: boolean;
+    syncIntervalMinutes?: number;
+    autoHealEnabled?: boolean;
+  }): Promise<StoredWallet> {
+    const doc = await this.readStore();
+    const normalizedWallet = ensureWallet(input.wallet);
+    const existing = doc.wallets.find(
+      (wallet) => wallet.propertyId === input.propertyId && wallet.wallet === normalizedWallet
+    );
+    if (!existing) {
+      throw new Error("Wallet not found.");
+    }
+
+    if (Object.prototype.hasOwnProperty.call(input, "label")) {
+      existing.label = input.label ?? null;
+    }
+    if (Object.prototype.hasOwnProperty.call(input, "strategyTag")) {
+      existing.strategyTag = input.strategyTag ?? null;
+    }
+    if (Object.prototype.hasOwnProperty.call(input, "syncEnabled")) {
+      existing.syncEnabled = Boolean(input.syncEnabled);
+    }
+    if (Object.prototype.hasOwnProperty.call(input, "syncIntervalMinutes")) {
+      existing.syncIntervalMinutes = Math.max(1, Number(input.syncIntervalMinutes ?? existing.syncIntervalMinutes));
+    }
+    if (Object.prototype.hasOwnProperty.call(input, "autoHealEnabled")) {
+      existing.autoHealEnabled = Boolean(input.autoHealEnabled);
+    }
+    existing.updatedAt = new Date().toISOString();
+    await this.writeStore(doc);
+    return existing;
   }
 
   async deleteWallet(propertyId: string, wallet: string): Promise<void> {
@@ -885,6 +1043,9 @@ class LocalFilePropertyStore implements PropertyStore {
     lastSuccessAt?: string | null;
     lastError?: string | null;
     recordsIngested?: number;
+    reliabilityStatus?: "pass" | "pass_with_trade_drift" | "mismatch" | null;
+    reliabilityCheckedAt?: string | null;
+    reliabilityTradeDelta?: number | null;
   }): Promise<StoredWalletSyncState> {
     const doc = await this.readStore();
     const normalizedWallet = ensureWallet(input.wallet);
@@ -912,6 +1073,15 @@ class LocalFilePropertyStore implements PropertyStore {
       if (Object.prototype.hasOwnProperty.call(input, "recordsIngested")) {
         existing.recordsIngested = input.recordsIngested ?? 0;
       }
+      if (Object.prototype.hasOwnProperty.call(input, "reliabilityStatus")) {
+        existing.reliabilityStatus = input.reliabilityStatus ?? null;
+      }
+      if (Object.prototype.hasOwnProperty.call(input, "reliabilityCheckedAt")) {
+        existing.reliabilityCheckedAt = input.reliabilityCheckedAt ?? null;
+      }
+      if (Object.prototype.hasOwnProperty.call(input, "reliabilityTradeDelta")) {
+        existing.reliabilityTradeDelta = input.reliabilityTradeDelta ?? null;
+      }
       existing.updatedAt = now;
       await this.writeStore(doc);
       return existing;
@@ -928,6 +1098,9 @@ class LocalFilePropertyStore implements PropertyStore {
       lastSuccessAt: input.lastSuccessAt ?? null,
       lastError: input.lastError ?? null,
       recordsIngested: input.recordsIngested ?? 0,
+      reliabilityStatus: input.reliabilityStatus ?? null,
+      reliabilityCheckedAt: input.reliabilityCheckedAt ?? null,
+      reliabilityTradeDelta: input.reliabilityTradeDelta ?? null,
       updatedAt: now
     };
     doc.syncStates.push(state);

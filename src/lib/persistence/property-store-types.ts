@@ -18,6 +18,9 @@ export interface StoredWallet {
   wallet: string;
   label: string | null;
   strategyTag: string | null;
+  syncEnabled: boolean;
+  syncIntervalMinutes: number;
+  autoHealEnabled: boolean;
   createdAt: string;
   updatedAt: string;
 }
@@ -43,6 +46,9 @@ export interface StoredWalletSyncState {
   lastSuccessAt: string | null;
   lastError: string | null;
   recordsIngested: number;
+  reliabilityStatus: "pass" | "pass_with_trade_drift" | "mismatch" | null;
+  reliabilityCheckedAt: string | null;
+  reliabilityTradeDelta: number | null;
   updatedAt: string;
 }
 
@@ -90,6 +96,18 @@ export interface PropertyStore {
     wallet: string;
     label?: string | null;
     strategyTag?: string | null;
+    syncEnabled?: boolean;
+    syncIntervalMinutes?: number;
+    autoHealEnabled?: boolean;
+  }): Promise<StoredWallet>;
+  updateWallet(input: {
+    propertyId: string;
+    wallet: string;
+    label?: string | null;
+    strategyTag?: string | null;
+    syncEnabled?: boolean;
+    syncIntervalMinutes?: number;
+    autoHealEnabled?: boolean;
   }): Promise<StoredWallet>;
   deleteWallet(propertyId: string, wallet: string): Promise<void>;
   getLatestSnapshot(propertyId: string, wallet: string): Promise<StoredWalletSnapshot | null>;
@@ -137,6 +155,9 @@ export interface PropertyStore {
     lastSuccessAt?: string | null;
     lastError?: string | null;
     recordsIngested?: number;
+    reliabilityStatus?: "pass" | "pass_with_trade_drift" | "mismatch" | null;
+    reliabilityCheckedAt?: string | null;
+    reliabilityTradeDelta?: number | null;
   }): Promise<StoredWalletSyncState>;
   getSyncState(propertyId: string, wallet: string): Promise<StoredWalletSyncState | null>;
 }
