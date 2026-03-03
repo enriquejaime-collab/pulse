@@ -1,0 +1,8 @@
+{
+  "crons": [
+    {
+      "path": "/api/ops/sync-due/cron",
+      "schedule": "*/5 * * * *"
+    }
+  ]
+}

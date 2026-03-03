@@ -28,17 +28,6 @@ const asMs = (value: string | null | undefined): number | null => {
 
 const getNowIso = (): string => new Date().toISOString();
 
-const isAuthorized = (request: Request): boolean => {
-  const expected = process.env.SYNC_CRON_SECRET ?? "";
-  if (!expected) {
-    return true;
-  }
-  const authHeader = request.headers.get("authorization") ?? "";
-  const tokenHeader = request.headers.get("x-sync-cron-secret") ?? "";
-  const bearer = authHeader.startsWith("Bearer ") ? authHeader.slice("Bearer ".length).trim() : "";
-  return bearer === expected || tokenHeader === expected;
-};
-
 const getDueWallets = async (): Promise<DueWallet[]> => {
   const store = getPropertyStore();
   const properties = await store.listProperties();
@@ -175,10 +164,6 @@ export async function GET(_request: Request) {
 }
 
 export async function POST(request: Request) {
-  if (!isAuthorized(request)) {
-    return NextResponse.json({ error: "Unauthorized scheduler run." }, { status: 401 });
-  }
-
   try {
     const url = new URL(request.url);
     const maxWalletsRaw = Number(url.searchParams.get("maxWallets") ?? "20");
