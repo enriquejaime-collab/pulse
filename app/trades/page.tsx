@@ -555,6 +555,11 @@ export default function TradesPage() {
     [selectedProperty, selectedWalletId]
   );
   const latestSyncRun = useMemo(() => syncRuns[0] ?? null, [syncRuns]);
+  const isHistoricalBackfillInProgress =
+    Boolean(summary) &&
+    syncState?.status === "success" &&
+    (lastSyncMode ?? latestSyncRun?.mode) === "incremental" &&
+    !syncState?.lastSuccessAt;
 
   const strategyClosedRows = useMemo(() => {
     if (!summary) {
@@ -985,6 +990,11 @@ export default function TradesPage() {
           <span className={`rounded-full border px-2.5 py-1 font-medium ${syncStatusPillClass(syncState?.status ?? null)}`}>
             Sync status: {syncState?.status ?? "idle"}
           </span>
+          {isHistoricalBackfillInProgress && (
+            <span className="rounded-full border border-amber-200 bg-amber-50 px-2.5 py-1 font-medium text-amber-800">
+              History backfill in progress
+            </span>
+          )}
           {lastSummarySource && (
             <span className="rounded-full border border-slate-200 bg-white px-2.5 py-1 font-medium text-slate-700">
               Last summary source: {lastSummarySource}
@@ -1017,6 +1027,12 @@ export default function TradesPage() {
         )}
 
         {error && <p className="mt-4 text-sm font-medium text-red-700">{error}</p>}
+        {isHistoricalBackfillInProgress && (
+          <p className="mt-2 text-xs text-amber-800">
+            Historical sync is still running in chunks for this wallet. Current all-time totals are partial and may
+            rise materially after additional syncs.
+          </p>
+        )}
       </section>
 
       {summary && (
@@ -1033,6 +1049,11 @@ export default function TradesPage() {
                 <p className="mt-1 text-xs text-slate-500">
                   {summary.totalTrades.toLocaleString()} trades · {formatUsd(summary.totalVolumeUsd)} volume
                 </p>
+                {isHistoricalBackfillInProgress && (
+                  <p className="mt-1 text-xs font-medium text-amber-800">
+                    Partial history only. These totals are still being backfilled and should not be treated as final.
+                  </p>
+                )}
               </div>
               <span className="text-xs font-medium text-slate-600">{isAllTimeSummaryOpen ? "Collapse" : "Expand"}</span>
             </button>
