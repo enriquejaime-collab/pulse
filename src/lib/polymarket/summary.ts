@@ -286,6 +286,7 @@ const extractArray = <T>(payload: unknown): T[] => {
 interface FetchOptions {
   maxOffset?: number;
   pageSize?: number;
+  offsetStart?: number;
   dedupeKey?: (row: unknown) => string;
   nonFatalStatuses?: number[];
   queryParams?: Record<string, string | number | boolean>;
@@ -294,6 +295,11 @@ interface FetchOptions {
   getRowTimestampMs?: (row: unknown) => number | null;
   requestDelayMs?: number;
   maxRateLimitRetries?: number;
+}
+
+interface PaginatedFetchResult<T> {
+  rows: T[];
+  reachedEnd: boolean;
 }
 
 const sleep = async (ms: number): Promise<void> => {
@@ -365,21 +371,29 @@ const tryParseJsonPayload = (raw: string): unknown | null => {
   }
 };
 
-const fetchPaginated = async <T>(endpoint: string, wallet: string, options: FetchOptions = {}): Promise<T[]> => {
+const fetchPaginated = async <T>(
+  endpoint: string,
+  wallet: string,
+  options: FetchOptions = {}
+): Promise<PaginatedFetchResult<T>> => {
   const pageSize = options.pageSize ?? 50;
+  const offsetStart = Math.max(0, Math.floor(options.offsetStart ?? 0));
   const maxOffset = options.maxOffset ?? 10_000;
   const maxPages = options.maxPages ?? Number.POSITIVE_INFINITY;
   const requestDelayMs = Math.max(0, Math.floor(options.requestDelayMs ?? 0));
   const maxRateLimitRetries = Math.max(0, Math.floor(options.maxRateLimitRetries ?? 6));
   const nonFatalStatuses = new Set(options.nonFatalStatuses ?? []);
   const allRows: T[] = [];
+  let reachedEnd = true;
 
   for (let page = 0; ; page += 1) {
     if (page >= maxPages) {
+      reachedEnd = false;
       break;
     }
-    const offset = page * pageSize;
+    const offset = offsetStart + page * pageSize;
     if (offset > maxOffset) {
+      reachedEnd = false;
       break;
     }
 
@@ -462,7 +476,10 @@ const fetchPaginated = async <T>(endpoint: string, wallet: string, options: Fetc
     }
   }
 
-  return dedupeRows(allRows, options.dedupeKey);
+  return {
+    rows: dedupeRows(allRows, options.dedupeKey),
+    reachedEnd
+  };
 };
 
 const estimateTradeFee = (trade: PolymarketTrade): number => {
@@ -1043,11 +1060,20 @@ export interface PolymarketSummaryDataSets {
   closedPositions: PolymarketPosition[];
   openPositions: PolymarketPosition[];
   activity: PolymarketActivity[];
+  syncMeta?: {
+    historyComplete: boolean;
+  };
 }
 
 export interface PolymarketFetchModeOptions {
   mode?: "full" | "incremental";
   sinceTimestampMs?: number | null;
+  offsetStart?: {
+    trades?: number;
+    closedPositions?: number;
+    openPositions?: number;
+    activity?: number;
+  };
 }
 
 export const fetchPolymarketSummaryDataSets = async (
@@ -1078,6 +1104,7 @@ export const fetchPolymarketSummaryDataSets = async (
       pageSize: 50,
       maxOffset: 100_000,
       maxPages,
+      offsetStart: options.offsetStart?.trades ?? 0,
       requestDelayMs,
       maxRateLimitRetries,
       nonFatalStatuses: [400],
@@ -1092,6 +1119,7 @@ export const fetchPolymarketSummaryDataSets = async (
       pageSize: 50,
       maxOffset: 100_000,
       maxPages,
+      offsetStart: options.offsetStart?.closedPositions ?? 0,
       requestDelayMs,
       maxRateLimitRetries,
       stopWhenAllRowsOlderThanMs: sinceTimestampMs ?? undefined,
@@ -1111,6 +1139,7 @@ export const fetchPolymarketSummaryDataSets = async (
     fetchPaginated<PolymarketPosition>("/positions", wallet, {
       pageSize: 50,
       maxOffset: 100_000,
+      offsetStart: options.offsetStart?.openPositions ?? 0,
       requestDelayMs,
       maxRateLimitRetries
     });
@@ -1120,6 +1149,7 @@ export const fetchPolymarketSummaryDataSets = async (
       pageSize: 50,
       maxOffset: 100_000,
       maxPages,
+      offsetStart: options.offsetStart?.activity ?? 0,
       requestDelayMs,
       maxRateLimitRetries,
       nonFatalStatuses: [400, 404],
@@ -1129,24 +1159,48 @@ export const fetchPolymarketSummaryDataSets = async (
 
   if (mode === "full") {
     // For high-volume wallets, serialize endpoint fetches to reduce burst pressure on API rate limits.
-    const closedPositions = await fetchClosedPositions();
+    const closedPositionsResult = await fetchClosedPositions();
     await sleep(150);
-    const trades = await fetchTrades();
+    const tradesResult = await fetchTrades();
     await sleep(150);
-    const openPositions = await fetchOpenPositions();
+    const openPositionsResult = await fetchOpenPositions();
     await sleep(150);
-    const activity = await fetchActivity();
-    return { trades, closedPositions, openPositions, activity };
+    const activityResult = await fetchActivity();
+    return {
+      trades: tradesResult.rows,
+      closedPositions: closedPositionsResult.rows,
+      openPositions: openPositionsResult.rows,
+      activity: activityResult.rows,
+      syncMeta: {
+        historyComplete:
+          tradesResult.reachedEnd &&
+          closedPositionsResult.reachedEnd &&
+          openPositionsResult.reachedEnd &&
+          activityResult.reachedEnd
+      }
+    };
   }
 
-  const [trades, closedPositions, openPositions, activity] = await Promise.all([
+  const [tradesResult, closedPositionsResult, openPositionsResult, activityResult] = await Promise.all([
     fetchTrades(),
     fetchClosedPositions(),
     fetchOpenPositions(),
     fetchActivity()
   ]);
 
-  return { trades, closedPositions, openPositions, activity };
+  return {
+    trades: tradesResult.rows,
+    closedPositions: closedPositionsResult.rows,
+    openPositions: openPositionsResult.rows,
+    activity: activityResult.rows,
+    syncMeta: {
+      historyComplete:
+        tradesResult.reachedEnd &&
+        closedPositionsResult.reachedEnd &&
+        openPositionsResult.reachedEnd &&
+        activityResult.reachedEnd
+    }
+  };
 };
 
 export const buildPolymarketSummaryFromDataSets = (

@@ -209,6 +209,13 @@ const resolveSyncMode = (
   return "incremental";
 };
 
+const getSnapshotBackfillOffsets = (summary: PolymarketSummary | null | undefined) => ({
+  trades: Math.max(0, summary?.records.trades ?? 0),
+  closedPositions: Math.max(0, summary?.records.closedPositions ?? 0),
+  openPositions: 0,
+  activity: Math.max(0, summary?.records.activity ?? 0)
+});
+
 export async function POST(request: Request, context: { params: Promise<{ propertyId: string }> }) {
   const { propertyId } = await context.params;
   let wallet = "";
@@ -252,9 +259,13 @@ export async function POST(request: Request, context: { params: Promise<{ proper
       }
     }
 
-    const existingSyncState = await store.getSyncState(propertyId, wallet);
+    const [existingSyncState, latestSnapshot] = await Promise.all([
+      store.getSyncState(propertyId, wallet),
+      store.getLatestSnapshot(propertyId, wallet)
+    ]);
     priorConsecutiveFailures = existingSyncState?.consecutiveFailures ?? 0;
     const mode = resolveSyncMode(Boolean(payload.forceFull), existingSyncState?.lastSuccessAt);
+    const isHistoricalBackfill = mode === "incremental" && !existingSyncState?.lastSuccessAt;
 
     const run = await store.createSyncRun({
       propertyId,
@@ -282,7 +293,8 @@ export async function POST(request: Request, context: { params: Promise<{ proper
 
     const fetchedDataSets = await fetchPolymarketSummaryDataSets(wallet, {
       mode,
-      sinceTimestampMs: Number.isFinite(incrementalSinceMs) ? incrementalSinceMs : null
+      sinceTimestampMs: Number.isFinite(incrementalSinceMs) ? incrementalSinceMs : null,
+      offsetStart: isHistoricalBackfill ? getSnapshotBackfillOffsets(latestSnapshot?.summary) : undefined
     });
 
     if (mode === "full") {
@@ -318,6 +330,8 @@ export async function POST(request: Request, context: { params: Promise<{ proper
       recordsIngested: countRecordsIngested(summary)
     });
 
+    const historyComplete = fetchedDataSets.syncMeta?.historyComplete ?? true;
+
     const [syncRun, syncState, syncRuns] = await Promise.all([
       store.finishSyncRun(run.id, {
         status: "success",
@@ -332,7 +346,7 @@ export async function POST(request: Request, context: { params: Promise<{ proper
         lastRunId: run.id,
         consecutiveFailures: 0,
         lastSyncAt: now,
-        lastSuccessAt: now,
+        lastSuccessAt: historyComplete ? now : null,
         lastError: null,
         recordsIngested
       }),
@@ -348,6 +362,10 @@ export async function POST(request: Request, context: { params: Promise<{ proper
         syncState,
         syncRun,
         syncRuns,
+        syncProgress: {
+          historyComplete,
+          backfillMode: isHistoricalBackfill
+        },
         ingestion: {
           recordsFetched: rawRecords.length,
           recordsUpserted: recordsIngested,
