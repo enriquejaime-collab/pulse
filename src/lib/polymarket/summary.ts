@@ -1123,6 +1123,10 @@ export const fetchPolymarketSummaryDataSets = async (
       offsetStart: options.offsetStart?.closedPositions ?? 0,
       requestDelayMs,
       maxRateLimitRetries,
+      queryParams: {
+        sortBy: "TIMESTAMP",
+        sortDirection: "DESC"
+      },
       stopWhenAllRowsOlderThanMs: sinceTimestampMs ?? undefined,
       getRowTimestampMs: (row) =>
         getObjectTimestampFromKeys(row, [
@@ -1154,6 +1158,10 @@ export const fetchPolymarketSummaryDataSets = async (
       requestDelayMs,
       maxRateLimitRetries,
       nonFatalStatuses: [400, 404],
+      queryParams: {
+        sortBy: "TIMESTAMP",
+        sortDirection: "DESC"
+      },
       stopWhenAllRowsOlderThanMs: sinceTimestampMs ?? undefined,
       getRowTimestampMs: (row) => getObjectTimestampFromKeys(row, ["timestamp", "createdAt", "created_at"])
     });
