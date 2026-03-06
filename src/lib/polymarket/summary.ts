@@ -414,9 +414,10 @@ const fetchPaginated = async <T>(
       const backoffMs = Math.min(10_000, 500 * 2 ** attempt) + Math.floor(Math.random() * 200);
 
       if (!response.ok) {
-        if (nonFatalStatuses.has(response.status) && page > 0) {
+        if (nonFatalStatuses.has(response.status) && (page > 0 || offsetStart > 0)) {
           // Some Data API endpoints return 400 when offset exceeds allowed max.
-          // Treat as "end of pagination" only after at least one successful page.
+          // During backfill, page 0 may already start past the end of an endpoint.
+          // Treat that as "end of pagination" instead of a hard failure.
           nonFatalPageTermination = true;
           break;
         }
