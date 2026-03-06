@@ -601,6 +601,9 @@ export default function SettingsPage() {
               <p className="mt-1 text-sm text-slate-600">
                 Due wallets run incremental sync first, then reliability check, with optional auto-heal full sync.
               </p>
+              <p className="mt-1 text-xs text-slate-500">
+                Scheduled execution depends on your hosting plan. You can always run due sync manually from this panel.
+              </p>
             </div>
             <button
               type="button"

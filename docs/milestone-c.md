@@ -25,14 +25,11 @@ Run this SQL in Supabase:
 
 - `supabase/migrations/20260302_milestone_c_scheduler.sql`
 
-## Vercel cron setup
+## Scheduling options
 
-This repo includes `vercel.json` with:
+Vercel Hobby plans have strict cron limits. If cron is unavailable, use `Run Due Sync Now` from Settings or trigger the cron endpoint from an external scheduler.
 
-- path: `/api/ops/sync-due/cron`
-- schedule: every 5 minutes (`*/5 * * * *`)
-
-### Required environment variable (Vercel)
+### Required environment variable (for protected cron endpoint)
 
 Set at least one secret in Project → Settings → Environment Variables:
 
