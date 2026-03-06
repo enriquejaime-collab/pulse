@@ -292,7 +292,38 @@ interface FetchOptions {
   maxPages?: number;
   stopWhenAllRowsOlderThanMs?: number;
   getRowTimestampMs?: (row: unknown) => number | null;
+  requestDelayMs?: number;
+  maxRateLimitRetries?: number;
 }
+
+const sleep = async (ms: number): Promise<void> => {
+  if (!Number.isFinite(ms) || ms <= 0) {
+    return;
+  }
+  await new Promise<void>((resolve) => {
+    setTimeout(resolve, ms);
+  });
+};
+
+const parseRetryAfterMs = (value: string | null): number | null => {
+  if (!value) {
+    return null;
+  }
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return null;
+  }
+  const seconds = Number(trimmed);
+  if (Number.isFinite(seconds) && seconds >= 0) {
+    return Math.round(seconds * 1000);
+  }
+  const asDateMs = Date.parse(trimmed);
+  if (!Number.isFinite(asDateMs)) {
+    return null;
+  }
+  const delayMs = asDateMs - Date.now();
+  return delayMs > 0 ? delayMs : null;
+};
 
 const dedupeRows = <T>(rows: T[], dedupeKey?: (row: unknown) => string): T[] => {
   if (!dedupeKey) {
@@ -316,6 +347,8 @@ const fetchPaginated = async <T>(endpoint: string, wallet: string, options: Fetc
   const pageSize = options.pageSize ?? 50;
   const maxOffset = options.maxOffset ?? 10_000;
   const maxPages = options.maxPages ?? Number.POSITIVE_INFINITY;
+  const requestDelayMs = Math.max(0, Math.floor(options.requestDelayMs ?? 0));
+  const maxRateLimitRetries = Math.max(0, Math.floor(options.maxRateLimitRetries ?? 6));
   const nonFatalStatuses = new Set(options.nonFatalStatuses ?? []);
   const allRows: T[] = [];
 
@@ -336,7 +369,26 @@ const fetchPaginated = async <T>(endpoint: string, wallet: string, options: Fetc
       url.searchParams.set(key, String(value));
     }
 
-    const response = await fetch(url.toString(), { cache: "no-store" });
+    let response: Response | null = null;
+    for (let attempt = 0; attempt <= maxRateLimitRetries; attempt += 1) {
+      response = await fetch(url.toString(), { cache: "no-store" });
+      if (response.status !== 429) {
+        break;
+      }
+
+      if (attempt >= maxRateLimitRetries) {
+        throw new Error(`Polymarket API rate limited (429) at ${endpoint}`);
+      }
+
+      const retryAfterMs = parseRetryAfterMs(response.headers.get("retry-after"));
+      const backoffMs = Math.min(10_000, 500 * 2 ** attempt) + Math.floor(Math.random() * 200);
+      await sleep(retryAfterMs ?? backoffMs);
+    }
+
+    if (!response) {
+      throw new Error(`Polymarket API request failed at ${endpoint}`);
+    }
+
     if (!response.ok) {
       if (nonFatalStatuses.has(response.status)) {
         // Some Data API endpoints return 400 when offset exceeds the allowed max.
@@ -367,6 +419,10 @@ const fetchPaginated = async <T>(endpoint: string, wallet: string, options: Fetc
 
     if (rows.length < pageSize) {
       break;
+    }
+
+    if (requestDelayMs > 0) {
+      await sleep(requestDelayMs);
     }
   }
 
@@ -964,12 +1020,16 @@ export const fetchPolymarketSummaryDataSets = async (
   const mode = options.mode ?? "full";
   // Incremental mode intentionally caps depth to keep sync fast. Full mode walks all pages.
   const maxPages = mode === "incremental" ? 200 : Number.POSITIVE_INFINITY;
+  const requestDelayMs = mode === "full" ? 25 : 0;
+  const maxRateLimitRetries = mode === "full" ? 8 : 4;
 
   const [trades, closedPositions, openPositions, activity] = await Promise.all([
     fetchPaginated<PolymarketTrade>("/trades", wallet, {
       pageSize: 50,
       maxOffset: 100_000,
       maxPages,
+      requestDelayMs,
+      maxRateLimitRetries,
       nonFatalStatuses: [400],
       queryParams: { takerOnly: false },
       dedupeKey: (row) => getTradeCanonicalKey(row as PolymarketTrade)
@@ -977,14 +1037,23 @@ export const fetchPolymarketSummaryDataSets = async (
     fetchPaginated<PolymarketPosition>("/closed-positions", wallet, {
       pageSize: 50,
       maxOffset: 100_000,
-      maxPages
+      maxPages,
+      requestDelayMs,
+      maxRateLimitRetries
     }),
     // Open positions are relatively small and represent current state, so always fetch full set.
-    fetchPaginated<PolymarketPosition>("/positions", wallet, { pageSize: 50, maxOffset: 100_000 }),
+    fetchPaginated<PolymarketPosition>("/positions", wallet, {
+      pageSize: 50,
+      maxOffset: 100_000,
+      requestDelayMs,
+      maxRateLimitRetries
+    }),
     fetchPaginated<PolymarketActivity>("/activity", wallet, {
       pageSize: 50,
       maxOffset: 100_000,
       maxPages,
+      requestDelayMs,
+      maxRateLimitRetries,
       nonFatalStatuses: [400, 404]
     })
   ]);
