@@ -201,9 +201,9 @@ const toSummaryDataSets = (raw: StoredRawDataSets) => ({
 
 const resolveSyncMode = (
   forceFull: boolean,
-  lastSuccessAt: string | null | undefined
+  _lastSuccessAt: string | null | undefined
 ): SyncRunMode => {
-  if (forceFull || !lastSuccessAt) {
+  if (forceFull) {
     return "full";
   }
   return "incremental";
@@ -275,8 +275,14 @@ export async function POST(request: Request, context: { params: Promise<{ proper
       lastError: null
     });
 
+    const incrementalSinceMs =
+      mode === "incremental" && existingSyncState?.lastSuccessAt
+        ? Date.parse(existingSyncState.lastSuccessAt)
+        : Number.NaN;
+
     const fetchedDataSets = await fetchPolymarketSummaryDataSets(wallet, {
-      mode
+      mode,
+      sinceTimestampMs: Number.isFinite(incrementalSinceMs) ? incrementalSinceMs : null
     });
 
     if (mode === "full") {

@@ -1047,6 +1047,7 @@ export interface PolymarketSummaryDataSets {
 
 export interface PolymarketFetchModeOptions {
   mode?: "full" | "incremental";
+  sinceTimestampMs?: number | null;
 }
 
 export const fetchPolymarketSummaryDataSets = async (
@@ -1054,10 +1055,24 @@ export const fetchPolymarketSummaryDataSets = async (
   options: PolymarketFetchModeOptions = {}
 ): Promise<PolymarketSummaryDataSets> => {
   const mode = options.mode ?? "full";
+  const sinceTimestampMs = typeof options.sinceTimestampMs === "number" ? options.sinceTimestampMs : null;
   // Incremental mode intentionally caps depth to keep sync fast. Full mode walks all pages.
-  const maxPages = mode === "incremental" ? 200 : Number.POSITIVE_INFINITY;
+  const maxPages = mode === "incremental" ? 40 : Number.POSITIVE_INFINITY;
   const requestDelayMs = mode === "full" ? 25 : 0;
   const maxRateLimitRetries = mode === "full" ? 8 : 4;
+  const getObjectTimestampFromKeys = (row: unknown, keys: string[]): number | null => {
+    if (!row || typeof row !== "object") {
+      return null;
+    }
+    const record = row as Record<string, unknown>;
+    for (const key of keys) {
+      const timestamp = tryParseTimestampMs(record[key]);
+      if (timestamp !== null) {
+        return timestamp;
+      }
+    }
+    return null;
+  };
   const fetchTrades = () =>
     fetchPaginated<PolymarketTrade>("/trades", wallet, {
       pageSize: 50,
@@ -1067,6 +1082,8 @@ export const fetchPolymarketSummaryDataSets = async (
       maxRateLimitRetries,
       nonFatalStatuses: [400],
       queryParams: { takerOnly: false },
+      stopWhenAllRowsOlderThanMs: sinceTimestampMs ?? undefined,
+      getRowTimestampMs: (row) => getObjectTimestampFromKeys(row, ["timestamp", "createdAt", "created_at"]),
       dedupeKey: (row) => getTradeCanonicalKey(row as PolymarketTrade)
     });
 
@@ -1076,7 +1093,17 @@ export const fetchPolymarketSummaryDataSets = async (
       maxOffset: 100_000,
       maxPages,
       requestDelayMs,
-      maxRateLimitRetries
+      maxRateLimitRetries,
+      stopWhenAllRowsOlderThanMs: sinceTimestampMs ?? undefined,
+      getRowTimestampMs: (row) =>
+        getObjectTimestampFromKeys(row, [
+          "timestamp",
+          "closedAt",
+          "closed_at",
+          "updatedAt",
+          "updated_at",
+          "endDate"
+        ])
     });
 
   const fetchOpenPositions = () =>
@@ -1095,7 +1122,9 @@ export const fetchPolymarketSummaryDataSets = async (
       maxPages,
       requestDelayMs,
       maxRateLimitRetries,
-      nonFatalStatuses: [400, 404]
+      nonFatalStatuses: [400, 404],
+      stopWhenAllRowsOlderThanMs: sinceTimestampMs ?? undefined,
+      getRowTimestampMs: (row) => getObjectTimestampFromKeys(row, ["timestamp", "createdAt", "created_at"])
     });
 
   if (mode === "full") {
