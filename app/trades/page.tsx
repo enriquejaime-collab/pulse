@@ -873,14 +873,26 @@ export default function TradesPage() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ wallet, forceRefresh: true })
       });
-      const payload = (await response.json()) as {
+
+      const rawPayload = await response.text();
+      let payload: {
         source?: "live" | "cache";
         mode?: "full" | "incremental";
         summary?: PolymarketSummaryResponse;
         syncState?: WalletSyncStateModel | null;
         syncRuns?: SyncRunModel[];
         error?: string;
-      };
+      } = {};
+
+      if (rawPayload.trim().length > 0) {
+        try {
+          payload = JSON.parse(rawPayload) as typeof payload;
+        } catch {
+          const summarized = rawPayload.replace(/\s+/g, " ").trim().slice(0, 180);
+          throw new Error(`Sync failed (${response.status}): ${summarized || "non-JSON response from server"}`);
+        }
+      }
+
       if (!response.ok || !payload.summary) {
         throw new Error(payload.error ?? "Failed to sync wallet.");
       }
