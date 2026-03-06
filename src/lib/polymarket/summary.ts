@@ -1022,8 +1022,7 @@ export const fetchPolymarketSummaryDataSets = async (
   const maxPages = mode === "incremental" ? 200 : Number.POSITIVE_INFINITY;
   const requestDelayMs = mode === "full" ? 25 : 0;
   const maxRateLimitRetries = mode === "full" ? 8 : 4;
-
-  const [trades, closedPositions, openPositions, activity] = await Promise.all([
+  const fetchTrades = () =>
     fetchPaginated<PolymarketTrade>("/trades", wallet, {
       pageSize: 50,
       maxOffset: 100_000,
@@ -1033,21 +1032,27 @@ export const fetchPolymarketSummaryDataSets = async (
       nonFatalStatuses: [400],
       queryParams: { takerOnly: false },
       dedupeKey: (row) => getTradeCanonicalKey(row as PolymarketTrade)
-    }),
+    });
+
+  const fetchClosedPositions = () =>
     fetchPaginated<PolymarketPosition>("/closed-positions", wallet, {
       pageSize: 50,
       maxOffset: 100_000,
       maxPages,
       requestDelayMs,
       maxRateLimitRetries
-    }),
+    });
+
+  const fetchOpenPositions = () =>
     // Open positions are relatively small and represent current state, so always fetch full set.
     fetchPaginated<PolymarketPosition>("/positions", wallet, {
       pageSize: 50,
       maxOffset: 100_000,
       requestDelayMs,
       maxRateLimitRetries
-    }),
+    });
+
+  const fetchActivity = () =>
     fetchPaginated<PolymarketActivity>("/activity", wallet, {
       pageSize: 50,
       maxOffset: 100_000,
@@ -1055,7 +1060,25 @@ export const fetchPolymarketSummaryDataSets = async (
       requestDelayMs,
       maxRateLimitRetries,
       nonFatalStatuses: [400, 404]
-    })
+    });
+
+  if (mode === "full") {
+    // For high-volume wallets, serialize endpoint fetches to reduce burst pressure on API rate limits.
+    const closedPositions = await fetchClosedPositions();
+    await sleep(150);
+    const trades = await fetchTrades();
+    await sleep(150);
+    const openPositions = await fetchOpenPositions();
+    await sleep(150);
+    const activity = await fetchActivity();
+    return { trades, closedPositions, openPositions, activity };
+  }
+
+  const [trades, closedPositions, openPositions, activity] = await Promise.all([
+    fetchTrades(),
+    fetchClosedPositions(),
+    fetchOpenPositions(),
+    fetchActivity()
   ]);
 
   return { trades, closedPositions, openPositions, activity };
