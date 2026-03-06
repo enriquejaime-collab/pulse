@@ -343,6 +343,28 @@ const dedupeRows = <T>(rows: T[], dedupeKey?: (row: unknown) => string): T[] => 
   return deduped;
 };
 
+const TRANSIENT_STATUSES = new Set([429, 500, 502, 503, 504]);
+
+const summarizeResponseBody = (raw: string): string => {
+  const collapsed = raw.replace(/\s+/g, " ").trim();
+  if (!collapsed) {
+    return "empty response body";
+  }
+  return collapsed.length > 180 ? `${collapsed.slice(0, 180)}...` : collapsed;
+};
+
+const tryParseJsonPayload = (raw: string): unknown | null => {
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    return [];
+  }
+  try {
+    return JSON.parse(trimmed) as unknown;
+  } catch {
+    return null;
+  }
+};
+
 const fetchPaginated = async <T>(endpoint: string, wallet: string, options: FetchOptions = {}): Promise<T[]> => {
   const pageSize = options.pageSize ?? 50;
   const maxOffset = options.maxOffset ?? 10_000;
@@ -369,39 +391,53 @@ const fetchPaginated = async <T>(endpoint: string, wallet: string, options: Fetc
       url.searchParams.set(key, String(value));
     }
 
-    let response: Response | null = null;
+    let payload: unknown | null = null;
+    let nonFatalPageTermination = false;
+
     for (let attempt = 0; attempt <= maxRateLimitRetries; attempt += 1) {
-      response = await fetch(url.toString(), { cache: "no-store" });
-      if (response.status !== 429) {
+      const response = await fetch(url.toString(), { cache: "no-store" });
+      const retryAfterMs = parseRetryAfterMs(response.headers.get("retry-after"));
+      const backoffMs = Math.min(10_000, 500 * 2 ** attempt) + Math.floor(Math.random() * 200);
+
+      if (!response.ok) {
+        if (nonFatalStatuses.has(response.status) && page > 0) {
+          // Some Data API endpoints return 400 when offset exceeds allowed max.
+          // Treat as "end of pagination" only after at least one successful page.
+          nonFatalPageTermination = true;
+          break;
+        }
+
+        if (TRANSIENT_STATUSES.has(response.status) && attempt < maxRateLimitRetries) {
+          await sleep(retryAfterMs ?? backoffMs);
+          continue;
+        }
+
+        throw new Error(`Polymarket API error (${response.status}) at ${endpoint}`);
+      }
+
+      const rawBody = await response.text();
+      const parsed = tryParseJsonPayload(rawBody);
+      if (parsed !== null) {
+        payload = parsed;
         break;
       }
 
-      if (attempt >= maxRateLimitRetries) {
-        throw new Error(`Polymarket API rate limited (429) at ${endpoint}`);
+      if (attempt < maxRateLimitRetries) {
+        await sleep(retryAfterMs ?? backoffMs);
+        continue;
       }
 
-      const retryAfterMs = parseRetryAfterMs(response.headers.get("retry-after"));
-      const backoffMs = Math.min(10_000, 500 * 2 ** attempt) + Math.floor(Math.random() * 200);
-      await sleep(retryAfterMs ?? backoffMs);
+      throw new Error(`Polymarket API returned non-JSON payload at ${endpoint}: ${summarizeResponseBody(rawBody)}`);
     }
 
-    if (!response) {
+    if (nonFatalPageTermination) {
+      break;
+    }
+
+    if (payload === null) {
       throw new Error(`Polymarket API request failed at ${endpoint}`);
     }
 
-    if (!response.ok) {
-      if (nonFatalStatuses.has(response.status)) {
-        // Some Data API endpoints return 400 when offset exceeds the allowed max.
-        // Treat that as "end of pagination" only after at least one successful page.
-        if (page > 0) {
-          break;
-        }
-        throw new Error(`Polymarket API error (${response.status}) at ${endpoint}`);
-      }
-      throw new Error(`Polymarket API error (${response.status}) at ${endpoint}`);
-    }
-
-    const payload = (await response.json()) as unknown;
     const rows = extractArray<T>(payload);
     allRows.push(...rows);
 
